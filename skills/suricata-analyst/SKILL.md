@@ -62,7 +62,19 @@ error type.
     script" below — instead of re-deriving the analysis from scratch. If it's close but not quite
     right (wrong input filename, needs an extra filter), adapt it rather than starting over. Only
     write new logic when no existing script covers the task.
-3.  **Sample the Data**: Always begin by sampling the logs to understand the schema and volume.
+3.  **Review prior findings**: There may be many `analyst_log-*.md` reports from earlier sessions
+    (potentially hundreds), so don't rely on `list_directory` for this — it returns every entry
+    with no limit and will flood context. Instead:
+    - Run `find_files('analyst_log-*.md')` to see how many reports exist and their timestamps.
+    - If there are more than a handful, use `search_files` with `include_glob='analyst_log-*.md'`
+      and a regex for terms relevant to the current task (an IP, hostname, domain, or topic like
+      `IoT|Alexa`) to find which specific reports already cover it — this is bounded (results are
+      capped) even when the listing itself is not.
+    - `read_file` only the reports that actually matched, not the whole set, so you build on what
+      was already found (devices, IPs, domains already identified) instead of rediscovering it from
+      scratch. Reference prior findings in your new report where they inform the current analysis,
+      and note anything that has changed since.
+4.  **Sample the Data**: Always begin by sampling the logs to understand the schema and volume.
     ```python
     import json
     import pathlib
@@ -81,7 +93,7 @@ error type.
             break
     f.close()
     ```
-4.  **Identify Event Types**: Determine which protocols are present.
+5.  **Identify Event Types**: Determine which protocols are present.
     ```python
     import json
     import pathlib
@@ -100,7 +112,7 @@ error type.
     for event_type, count in sorted(event_types.items(), key=lambda kv: -kv[1]):
         print(count, event_type)
     ```
-5.  **Consult References**: For detailed field mapping, read `/skill/references/eve_format.md`
+6.  **Consult References**: For detailed field mapping, read `/skill/references/eve_format.md`
     from inside `run_code` (e.g. `pathlib.Path("/skill/references/eve_format.md").read_text()`).
 
 **Running a saved script**: Monty has no `exec`/`eval` and no way to `import` a file saved in
@@ -121,6 +133,7 @@ works here; treat the saved `.py` file as a code template you paste from, not a 
 - **Python Style**: The sandbox only has stdlib `json` and `pathlib` available — there is no `orjson`, `polars`, or `duckdb`. Parse EVE lines with `json.loads` and stream over the file with `pathlib.Path(...).open()` and `f.readline()` in a `while` loop (see Sandbox Notes — `for line in f:` is not supported) rather than loading it all into memory.
 - **Script Naming**: All scripts should start with `suricata_` and use a short purpose-based name (for example, `suricata_tls_sni.py`), without timestamps.
 - **Reuse Before Rewrite**: Always check `/workspace` for an existing `suricata_*.py` script before writing new analysis logic (Step 1). Read and adapt it rather than re-deriving the same analysis — see "Running a saved script" above for how to actually execute a saved script's contents.
+- **Context Before New Analysis**: Always check for existing `analyst_log-*.md` reports before starting new analysis (Step 1). Use `find_files`/`search_files` rather than `list_directory` to locate the relevant ones without flooding context as the report count grows, and read only those before starting, so findings build on prior sessions instead of starting cold each time.
 
 ## Examples
 
