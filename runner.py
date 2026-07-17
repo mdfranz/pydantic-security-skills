@@ -200,6 +200,9 @@ def main():
         print("\n--- Agent Response ---")
         print(result.output)
 
+        # Collect all outputs for analyst_log (especially important in interactive mode)
+        all_outputs = [result.output]
+
         # In interactive mode, handle checkpoints until user says stop
         if args.interactive:
             checkpoint_count = 1
@@ -221,6 +224,7 @@ def main():
                     result = agent.run_sync(continuation_prompt)
                     print("\n--- Analysis Continued ---")
                     print(result.output)
+                    all_outputs.append(result.output)
                     checkpoint_count += 1
                 else:
                     # User specified a different focus
@@ -235,6 +239,7 @@ def main():
                         result = agent.run_sync(continuation_prompt)
                         print("\n--- Focused Analysis ---")
                         print(result.output)
+                        all_outputs.append(result.output)
                         checkpoint_count += 1
                     else:
                         print("Could not parse focus. Use 'continue', 'stop', or 'focus on <topic>'.")
@@ -242,13 +247,25 @@ def main():
         # Save the full conversation and findings independently of the transcript
         report_path = ws_path / f"analyst_log-{run_stamp}.md"
         conversation = format_conversation_history(result, run_prompt)
+
+        # In interactive mode, combine all checkpoint outputs
+        if args.interactive and len(all_outputs) > 1:
+            combined_findings = "\n\n---\n\n".join(
+                f"### Checkpoint {i + 1}\n{output}"
+                for i, output in enumerate(all_outputs)
+            )
+            findings_section = f"## Analysis Checkpoints\n\n{combined_findings}\n"
+        else:
+            findings_section = f"## Final Findings\n\n{result.output}\n"
+
         report_path.write_text(
             f"# Analysis Report\n\n"
             f"- Skill: `{skill_path.name}`\n"
             f"- Prompt: {args.prompt}\n"
-            f"- Run: `{run_stamp}`\n\n"
+            f"- Run: `{run_stamp}`\n"
+            f"- Mode: {'Interactive (multiple checkpoints)' if args.interactive else 'Standard'}\n\n"
             f"{conversation}\n"
-            f"## Final Findings\n\n{result.output}\n",
+            f"{findings_section}",
             encoding="utf-8",
         )
         print(f"\nSaved analysis report: {report_path}")
