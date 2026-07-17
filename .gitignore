@@ -1,0 +1,5 @@
+.venv/
+.logfire/
+workspace/
+__pycache__/
+*.pyc
