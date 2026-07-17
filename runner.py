@@ -130,10 +130,15 @@ def main():
     )
 
     if args.logfire:
-        import logfire
+        try:
+            import logfire
 
-        logfire.configure()
-        logfire.instrument_pydantic_ai()
+            logfire.configure()
+            logfire.instrument_pydantic_ai()
+            print("Logfire configured and instrumentation enabled.")
+        except Exception as e:
+            print(f"Logfire not available: {e}")
+            print("Continuing without Logfire tracing.")
 
     skill_path = Path(args.skill_dir)
     config = load_skill(skill_path)
