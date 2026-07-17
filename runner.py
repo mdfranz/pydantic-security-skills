@@ -110,6 +110,11 @@ def main():
         help="Trace the run with Logfire. Prints spans to the console with no setup; "
         "also ships to the Logfire UI if LOGFIRE_TOKEN is set (or `logfire auth` has been run).",
     )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Interactive mode: agent explains its investigation plan and asks for confirmation before deep analysis.",
+    )
     args = parser.parse_args()
 
     ws_path = Path(args.workspace).resolve()
@@ -143,6 +148,20 @@ def main():
     skill_path = Path(args.skill_dir)
     config = load_skill(skill_path)
     instructions = config.get("instructions", "You are a security analyst.")
+
+    # In interactive mode, add checkpoint instructions after major analysis phases
+    if args.interactive:
+        instructions += (
+            "\n\n## INTERACTIVE MODE: Frequent Checkpoints\n\n"
+            "After each major analysis phase (discovery, initial findings, threat hunting, etc.), "
+            "STOP and ask the user:\n"
+            "- What you've found so far\n"
+            "- What you plan to investigate next (if anything)\n"
+            "- Ask: 'Continue with [next analysis]?' (yes/no/focus on X instead)\n\n"
+            "Do NOT assume the user wants exhaustive analysis. Keep analysis scope under user control. "
+            "If user says 'no', wrap up with what you have. If they say 'focus on X', pivot to that. "
+            "Multiple short checkpoints are better than one long silent analysis."
+        )
 
     agent = Agent(
         args.model,
@@ -180,6 +199,45 @@ def main():
         result = agent.run_sync(run_prompt)
         print("\n--- Agent Response ---")
         print(result.output)
+
+        # In interactive mode, handle checkpoints until user says stop
+        if args.interactive:
+            checkpoint_count = 1
+            while True:
+                print("\n" + "=" * 60)
+                user_input = input(
+                    f"\n[Checkpoint {checkpoint_count}] Continue, stop, or adjust focus? (continue/stop/focus on X): "
+                ).strip()
+
+                if user_input.lower() == "stop":
+                    print("Wrapping up analysis.")
+                    break
+                elif user_input.lower() == "continue":
+                    print("Continuing analysis...\n")
+                    continuation_prompt = (
+                        "The user wants to continue. Proceed with the next phase of analysis you outlined. "
+                        "After completing this phase, summarize what you found and ask if they want to continue further."
+                    )
+                    result = agent.run_sync(continuation_prompt)
+                    print("\n--- Analysis Continued ---")
+                    print(result.output)
+                    checkpoint_count += 1
+                else:
+                    # User specified a different focus
+                    focus = user_input.replace("focus on ", "").strip()
+                    if focus:
+                        print(f"Pivoting to focus on: {focus}\n")
+                        continuation_prompt = (
+                            f"The user wants to shift focus to: {focus}\n\n"
+                            "Adjust your analysis to focus on this area specifically. After this analysis phase, "
+                            "ask if they want to continue investigating other angles."
+                        )
+                        result = agent.run_sync(continuation_prompt)
+                        print("\n--- Focused Analysis ---")
+                        print(result.output)
+                        checkpoint_count += 1
+                    else:
+                        print("Could not parse focus. Use 'continue', 'stop', or 'focus on <topic>'.")
 
         # Save the full conversation and findings independently of the transcript
         report_path = ws_path / f"analyst_log-{run_stamp}.md"
