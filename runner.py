@@ -61,32 +61,33 @@ def format_conversation_history(result, prompt: str) -> str:
 
     for msg in result.all_messages():
         if isinstance(msg, ModelRequest):
-            # Show the request context
-            for part in msg.parts:
-                if hasattr(part, 'content'):
-                    lines.append(f"**Request:** {part.content}\n")
+            # Skip showing request context to keep logs concise
+            pass
         elif isinstance(msg, ModelResponse):
             # Show model response and tool interactions
             for part in msg.parts:
                 if isinstance(part, ToolCallPart):
-                    lines.append(f"#### Tool Call: `{part.tool_name}` (ID: {part.tool_call_id})\n")
-                    if part.args:
-                        try:
-                            args = part.args_as_dict()
-                            if part.tool_name == "run_code":
-                                code = args.get("code", "")
-                                lines.append(f"```python\n{code}\n```\n")
-                            else:
+                    # Skip run_code calls since the generated code is saved to disk
+                    if part.tool_name == "run_code":
+                        lines.append(f"#### Tool Call: `run_code` (ID: {part.tool_call_id})\n")
+                        lines.append("(Code saved to generated_code/ directory)\n\n")
+                    else:
+                        lines.append(f"#### Tool Call: `{part.tool_name}` (ID: {part.tool_call_id})\n")
+                        if part.args:
+                            try:
+                                args = part.args_as_dict()
                                 lines.append(f"```json\n{json.dumps(args, indent=2)}\n```\n")
-                        except Exception:
-                            lines.append(f"```\n{part.args}\n```\n")
+                            except Exception:
+                                lines.append(f"```\n{part.args}\n```\n")
                 elif isinstance(part, ToolReturnPart):
-                    lines.append(f"#### Tool Result: `{part.tool_name}` (ID: {part.tool_call_id})\n")
-                    # Truncate very long outputs
-                    content = part.content
-                    if len(str(content)) > 1000:
-                        content = str(content)[:1000] + "\n... (truncated)"
-                    lines.append(f"```\n{content}\n```\n")
+                    # Skip run_code returns to keep logs concise
+                    if part.tool_name != "run_code":
+                        lines.append(f"#### Tool Result: `{part.tool_name}` (ID: {part.tool_call_id})\n")
+                        # Truncate very long outputs
+                        content = part.content
+                        if len(str(content)) > 1000:
+                            content = str(content)[:1000] + "\n... (truncated)"
+                        lines.append(f"```\n{content}\n```\n")
                 else:
                     # Text content from model
                     if hasattr(part, 'content') and str(part.content).strip():
