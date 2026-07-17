@@ -1,4 +1,5 @@
 import argparse
+import json
 import logging
 import sys
 from datetime import datetime
@@ -6,7 +7,7 @@ from pathlib import Path
 
 import yaml
 from pydantic_ai import Agent
-from pydantic_ai.messages import ToolCallPart, ToolReturnPart
+from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart
 from pydantic_ai_harness import CodeMode, FileSystem
 from pydantic_monty import MountDir, OSAccess
 
@@ -46,6 +47,52 @@ def load_skill(skill_dir: Path):
             config["instructions"] = f.read()
 
     return config
+
+def format_conversation_history(result, prompt: str) -> str:
+    """Format the full agent conversation including all tool calls and results."""
+    lines = ["## Conversation History\n"]
+
+    # User prompt
+    lines.append("### User Prompt\n")
+    lines.append(f"```\n{prompt}\n```\n")
+
+    # Messages and tool interactions
+    lines.append("### Agent Communication\n")
+
+    for msg in result.all_messages():
+        if isinstance(msg, ModelRequest):
+            # Show the request context
+            for part in msg.parts:
+                if hasattr(part, 'content'):
+                    lines.append(f"**Request:** {part.content}\n")
+        elif isinstance(msg, ModelResponse):
+            # Show model response and tool interactions
+            for part in msg.parts:
+                if isinstance(part, ToolCallPart):
+                    lines.append(f"#### Tool Call: `{part.tool_name}` (ID: {part.tool_call_id})\n")
+                    if part.args:
+                        try:
+                            args = part.args_as_dict()
+                            if part.tool_name == "run_code":
+                                code = args.get("code", "")
+                                lines.append(f"```python\n{code}\n```\n")
+                            else:
+                                lines.append(f"```json\n{json.dumps(args, indent=2)}\n```\n")
+                        except Exception:
+                            lines.append(f"```\n{part.args}\n```\n")
+                elif isinstance(part, ToolReturnPart):
+                    lines.append(f"#### Tool Result: `{part.tool_name}` (ID: {part.tool_call_id})\n")
+                    # Truncate very long outputs
+                    content = part.content
+                    if len(str(content)) > 1000:
+                        content = str(content)[:1000] + "\n... (truncated)"
+                    lines.append(f"```\n{content}\n```\n")
+                else:
+                    # Text content from model
+                    if hasattr(part, 'content') and str(part.content).strip():
+                        lines.append(f"**Agent:** {part.content}\n\n")
+
+    return "".join(lines)
 
 def main():
     parser = argparse.ArgumentParser(description="Pydantic AI Security Skill Runner")
@@ -128,15 +175,16 @@ def main():
         print("\n--- Agent Response ---")
         print(result.output)
 
-        # Save the final answer independently of the transcript so it can be
-        # consumed as the run's report without parsing console output.
+        # Save the full conversation and findings independently of the transcript
         report_path = ws_path / f"analyst_log-{run_stamp}.md"
+        conversation = format_conversation_history(result, run_prompt)
         report_path.write_text(
             f"# Analysis Report\n\n"
             f"- Skill: `{skill_path.name}`\n"
             f"- Prompt: {args.prompt}\n"
             f"- Run: `{run_stamp}`\n\n"
-            f"## Findings\n\n{result.output}\n",
+            f"{conversation}\n"
+            f"## Final Findings\n\n{result.output}\n",
             encoding="utf-8",
         )
         print(f"\nSaved analysis report: {report_path}")
