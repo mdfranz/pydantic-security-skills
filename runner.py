@@ -96,6 +96,7 @@ def main():
         capabilities=[
             FileSystem(root_dir=str(ws_path)),
             CodeMode(
+                tools=[],  # Keep FileSystem tools native so they're callable without run_code
                 mount=MountDir(SANDBOX_WORKSPACE_MOUNT, str(ws_path), mode="read-write"),
                 # Empty environ keeps host env vars isolated; only the host clock is exposed,
                 # so generated code can timestamp filenames per the skill's naming convention.
