@@ -44,6 +44,11 @@ Flags:
 - `--debug` — prints the Python code the model generated and ran inside the Monty sandbox for each `run_code` call, plus its return value.
 - `--logfire` — traces the run with [Logfire](https://pydantic.dev/logfire). Prints a live span tree to the console with zero setup; also ships to the Logfire UI once authenticated (see below).
 
+Every run also retains artifacts in the workspace: `runner-YY-MM-DD_HH-MM-SS.log` contains the
+full transcript, `generated_code/` contains each generated `run_code` program, and
+`analyst_log-YY-MM-DD_HH-MM-SS.md` contains the final analysis response. The agent is additionally
+instructed to save reusable scripts and intermediate findings with the filesystem tools.
+
 ## Optional: Logfire tracing
 
 One-time setup, per machine:
