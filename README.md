@@ -10,10 +10,12 @@ threats, suspicious egress, protocol anomalies).
 ## How it works
 
 - `runner.py` loads a skill's `SKILL.md` as the agent's instructions.
-- The agent gets a `FileSystem` capability scoped to `./workspace` (read/write/search files) and
-  `CodeMode`, which wraps every tool — including `FileSystem`'s — into a single sandboxed
-  `run_code` tool. The model writes Python that calls those tools; the code itself runs inside
-  Monty, with no host filesystem/env/clock access beyond what the wrapped tools expose.
+- The agent gets a `FileSystem` capability scoped to `./workspace` (read/write/search files),
+  called natively — `CodeMode` is configured with `tools=[]`, so it doesn't wrap any tool behind
+  `run_code`; `run_code` is purely a sandboxed Python execution surface. Inside it, `pathlib`
+  reaches two mounted directories: `/workspace` (read-write, the same directory `FileSystem` is
+  scoped to) and `/skill` (read-only, the current skill's own directory, for reference material
+  like `references/*.md`). No other host filesystem/env/clock access is available.
 - Analysis is native Python + `json` only — Monty permits a fixed stdlib subset (`sys`, `typing`,
   `asyncio`, `math`, `json`, `re`, `datetime`, `os`, `pathlib`), no third-party imports and no class
   definitions, so DuckDB/Polars/pandas can never run inside the sandbox regardless of what a skill

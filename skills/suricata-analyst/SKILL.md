@@ -17,14 +17,20 @@ Generated code runs in the Monty sandbox, not host Python: no third-party import
 `collections`, no `orjson`/`polars`/`duckdb`). There is no `open()` builtin — use `pathlib.Path`
 instead. The workspace is mounted read-write at `/workspace`, so any files written with
 `write_file` are reachable at `/workspace/<name>` from sandboxed code — but do not assume the
-*input* EVE log is named `eve.json`; see "Find the input file" below.
+*input* EVE log is named `eve.json`; see "Find the input file" below. This skill's own directory
+is separately mounted **read-only** at `/skill`, so reference material lives at
+`/skill/references/<name>` (e.g. `/skill/references/eve_format.md`) — readable from `run_code`
+only, since the FileSystem tool's root is the workspace, not the skill directory.
 
-Two different path namespaces are in play — do not mix them up:
-- **`run_code` (Monty sandbox)**: paths are absolute against the mount, e.g. `/workspace/eve.json`.
+Three different path namespaces are in play — do not mix them up:
+- **`run_code` (Monty sandbox), workspace mount**: paths are absolute against the mount, e.g.
+  `/workspace/eve.json`.
+- **`run_code` (Monty sandbox), skill mount**: read-only, e.g. `/skill/references/eve_format.md`.
+  Writes here fail — this mount exists for reading reference material, not saving anything.
 - **`list_directory` / `read_file` / `write_file` (FileSystem tool)**: paths are relative to the
   workspace root itself, e.g. `list_directory(path='.')` or `write_file('notes.md', ...)`. Passing
-  `/workspace` to these tools fails with "Path '/workspace' resolves outside the root directory" —
-  the `/workspace` prefix is only meaningful inside `run_code`.
+  `/workspace` (or `/skill`) to these tools fails with "Path resolves outside the root directory" —
+  those prefixes are only meaningful inside `run_code`.
 
 File objects from `pathlib.Path(...).open()` do **not** support `for line in f:` — that raises
 `TypeError: '_io.TextIOWrapper' object is not iterable`. Always read line-by-line with an explicit
@@ -94,7 +100,8 @@ error type.
     for event_type, count in sorted(event_types.items(), key=lambda kv: -kv[1]):
         print(count, event_type)
     ```
-5.  **Consult References**: For detailed field mapping, refer to `references/eve_format.md`.
+5.  **Consult References**: For detailed field mapping, read `/skill/references/eve_format.md`
+    from inside `run_code` (e.g. `pathlib.Path("/skill/references/eve_format.md").read_text()`).
 
 **Running a saved script**: Monty has no `exec`/`eval` and no way to `import` a file saved in
 `/workspace` — sandbox restrictions block both. There is no "run this file" call. To reuse a saved

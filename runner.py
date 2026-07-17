@@ -11,6 +11,7 @@ from pydantic_ai_harness import CodeMode, FileSystem
 from pydantic_monty import MountDir, OSAccess
 
 SANDBOX_WORKSPACE_MOUNT = "/workspace"
+SANDBOX_SKILL_MOUNT = "/skill"
 
 
 class TeeWriter:
@@ -97,7 +98,12 @@ def main():
             FileSystem(root_dir=str(ws_path)),
             CodeMode(
                 tools=[],  # Keep FileSystem tools native so they're callable without run_code
-                mount=MountDir(SANDBOX_WORKSPACE_MOUNT, str(ws_path), mode="read-write"),
+                mount=[
+                    MountDir(SANDBOX_WORKSPACE_MOUNT, str(ws_path), mode="read-write"),
+                    # Read-only so generated code can consult a skill's reference material
+                    # (e.g. references/*.md) without being able to modify the skill itself.
+                    MountDir(SANDBOX_SKILL_MOUNT, str(skill_path.resolve()), mode="read-only"),
+                ],
                 # Empty environ keeps host env vars isolated; only the host clock is exposed,
                 # so generated code can timestamp filenames per the skill's naming convention.
                 os_access=OSAccess(environ={}),
