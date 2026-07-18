@@ -230,3 +230,174 @@ is what exposed the Phase 5 gap described above.
 correct) against real API responses across three providers, a recurring reused-script bug is
 fixed and documented against recurrence, and dependencies are current within the project's
 standing update policy.
+
+### Phase 7: Task-Scoped Workspaces (2026-07-18, 15:38-15:53)
+
+**Objective:** Implement `refs/workspace-lifecycle.md` — give the runner an accumulate/pristine
+choice per run without touching the execution model, replace the console transcript with a
+richer host-only audit trail, and separate canonical input evidence from agent-produced state.
+A superseded, snapshot-based (`MontyRepl.dump()`) draft of that same doc was set aside earlier;
+this phase implements the file-based directory design that replaced it, not any interpreter-state
+serialization.
+
+**`--task`/`--pristine` CLI flags and task-id resolution**
+- `--workspace` now means the workspace **base/case root**, not the agent's own directory —
+  a breaking layout change (see "Behavior change to confirm" in the design doc). Its default
+  layout is `./workspace/data`, `./workspace/<task>`, `./workspace/logs`.
+- Added `resolve_task_id()`: `--task <name>` accumulates into a named directory (validated
+  against `^[a-z0-9][a-z0-9_-]{0,63}$`, `default`/`data`/`logs` reserved), `--pristine` defers to
+  auto-generated `task-<uuid4>` id, neither falls back to `default`. `--task`/`--pristine` are a
+  mutually exclusive `argparse` group.
+- Added `create_task_root()`/`create_pristine_task_root()`: task roots must resolve to a real,
+  direct child of the workspace base (rejecting symlinks and non-directories); pristine creates
+  its directory exclusively (`mkdir` without `exist_ok`), retrying on the vanishingly unlikely
+  UUID4 collision.
+
+**Three-domain mount layout**
+- Added a fourth `MountDir` at `/data` (read-only) alongside the existing `/workspace` (rw,
+  now task-scoped) and `/skill` (ro) mounts — canonical input evidence, shared across tasks
+  (including pristine ones) but never copied into a task workspace.
+- `FileSystem`'s root moved from the workspace base to the resolved task root, so it structurally
+  cannot reach `/data`, `workspace/logs/`, or another task's directory.
+- Runner now lists `data_dir` at startup and injects the `/data/<filename>` inventory into the
+  prompt, since the FileSystem tool can't see `/data` for the agent to discover it itself.
+  Updated `prompts/sandbox_notes.md` (three path namespaces → four) and both skills'
+  `SKILL.md` "Find the input file" steps accordingly.
+
+**Host-only JSONL audit log, replacing the console transcript**
+- Removed the old `TeeWriter`-into-workspace transcript and `logging.basicConfig` file handler.
+- Added `AuditLog` (flushes each event immediately) and `make_event_stream_handler()`, which taps
+  `agent.run_sync`'s `event_stream_handler` to log model text/thinking, tool calls/results, and
+  `run_code` bodies/returns *incrementally* — not reconstructed after the fact — so an
+  interrupted or failed run still leaves a complete record. Files land at
+  `workspace/logs/runner-<task_id>-<run_id>.jsonl`, a flat sibling of the task directories and
+  therefore unreachable through either agent access point.
+- `run_start`/`prompt`/`error`/`run_end` events bracket each `run_sync` call, including the
+  interactive-mode continuation/focus prompts.
+- `Agent(name=skill_path.name, ...)` keeps a stable telemetry identity; `task_id`/`run_id` are
+  attached as run `metadata` on every `run_sync` call instead.
+
+**Verified live** against `google:gemini-3-flash-preview` in a scratch workspace: reserved-name
+and invalid-regex task ids correctly hit `parser.error()` before any model call; default,
+named-accumulate (with a real `eve-*.json` under `data/`), and `--pristine` runs each produced
+the expected `data/` + `<task>/` + `logs/` layout; the JSONL audit file contained a well-formed
+`run_start → prompt → tool_call → tool_result → model_text → run_end` sequence. The repo's own
+`workspace/data/eve-2026-01-06-01.json` was already laid out correctly, so no migration was
+needed there.
+
+**Docs:** Updated `README.md` (case-root layout, task flags, audit-log description) and
+`ARCHITECTURE.md` (component diagram, capabilities, Monty sandbox, workspace/audit-log sections,
+trust-boundary diagram) to match. `refs/workspace-lifecycle.md` itself is the design source of
+truth and was not modified.
+
+**Result:** The runner now supports both accumulate and pristine task workspaces from a single
+`--task`/`--pristine` flag pair, canonical input evidence is structurally separated from agent
+state, and every run leaves a complete, host-only audit trail even when it fails partway through.
+
+### Phase 8: Compliance Audit & Two Hardening Fixes (2026-07-18, 16:00-16:41)
+
+**Objective:** Verify Phase 7's implementation against `refs/workspace-lifecycle.md` with live
+runs (not just re-reading the code), across three real model/task combinations, then close the
+gaps that verification actually found.
+
+**Live verification against three models, three tasks:** Ran the same "summarize ports and
+protocols" prompt against `google:gemini-3-flash-preview`, `google:gemini-3.5-flash` (same
+accumulated task, `logfire-metadata-check`), and `openrouter:deepseek/deepseek-v4-pro` (fresh
+task, `deepseek-v4-pro-check`) with `--logfire` enabled. Cross-checked each run two ways: the
+audit JSONL on disk, and the actual span tree queried live from the `tomfoolery` Logfire project
+via `mcp__logfire__query_run`. Confirmed the `invoke_agent suricata-analyst` root span carries
+`metadata.task_id`/`metadata.run_id` matching the audit file's `run_id` in every case (note:
+metadata lands on the root span only, not propagated to child `chat`/`execute_tool` spans —
+pydantic-ai's behavior, not a bug here). Confirmed empirically, not just by reading the mount
+config, that `FileSystem`'s `list_directory` never once surfaced `data/`, `logs/`, or another
+task's contents across 5 real audit logs — only task-local files.
+
+**Gaps found:**
+1. Killing a run with an unhandled `SIGTERM` (e.g. a shell `timeout` wrapper, as opposed to
+   `Ctrl+C`) bypassed `runner.py`'s `finally` block entirely, since Python installs no default
+   handler for `SIGTERM`. Reproduced live: `runner-logfire-metadata-check-9267c4dd....jsonl`
+   has 46KB of real events but no `run_end` — every individual event was still flushed on write,
+   but the file never got its closing marker.
+2. `workspace/logs/*.jsonl` was `0644` / dirs `0755` (umask defaults) — the doc's own "Retention
+   and permissions" open item flags this as needed before use on sensitive cases, and it wasn't
+   done yet.
+3. (Not fixed, not a bug — confirmed as documented, agent-dependent behavior) deepseek-v4-pro's
+   run left zero reusable `suricata_*.py` scripts despite 10 `run_code` calls, matching the
+   doc's explicit caveat that only the script *listing* mechanism is runner-guaranteed, not that
+   the agent chooses to write one.
+
+**Fixes applied (user chose these two from a 4-option menu; task locking and retention/pruning
+were declined as legitimate scope expansions beyond what the doc specifies):**
+- Added `RunInterrupted(BaseException)` + a `signal.signal(signal.SIGTERM, ...)` handler in
+  `runner.py`, registered right after the `AuditLog` is constructed. `SIGTERM` now raises
+  through the same `try/except/finally` `KeyboardInterrupt` already used, logging a distinct
+  `{"event": "interrupted", "reason": "received signal 15"}` before `run_end`, and the process
+  exits `143` (the `128 + SIGTERM` convention) instead of a raw traceback. `SIGKILL` remains
+  uncatchable by design — an OS limit, out of scope for any fix.
+- `logs_dir.chmod(0o700)` (re-applied every run, not just on first creation) and
+  `AuditLog.path.chmod(0o600)` at file creation.
+
+**Verified live:** Interrupted a real in-flight `gemini-3.5-flash` `run_code` call with
+`kill -TERM` after ~12s — confirmed exit code `143`, `workspace/logs/` at `drwx------`, the
+`.jsonl` at `-rw-------`, and the audit tail showing a clean
+`interrupted → run_end: failed` sequence, in direct contrast to the pre-fix file from item 1
+above (no closing event, world-readable).
+
+**Docs:** Updated `ARCHITECTURE.md`'s audit-log section with a "Retention and permissions"
+subsection describing both fixes and the `SIGKILL` limit. `refs/workspace-lifecycle.md` itself
+was not modified (design source of truth).
+
+**Result:** Every audit record for a run terminated by `SIGTERM` now closes cleanly with an
+explicit `interrupted`/`run_end` pair instead of trailing off mid-event, and `workspace/logs/`
+is owner-only regardless of the host's umask. Task-level locking and a retention/pruning policy
+remain deliberately unimplemented, per the doc's own "Open items" section.
+
+### Phase 9: Cross-Session Agent Memory (2026-07-18, 18:38-18:43)
+
+**Objective:** Give the agent a way to persist curated notes across runs of the same task,
+without reintroducing the "prior agent state" that `--pristine` exists to exclude, and without
+skewing the cross-model comparisons `compare_models.sh` depends on.
+
+**Design:** Wired `pydantic_ai_harness.memory.Memory` — a separate, already-installed
+(`pydantic-ai-harness==0.7.0`) capability providing a bounded, auto-injected `MEMORY.md`
+notebook plus `read_memory`/`write_memory`/`search_memory`/`delete_memory` tools — into
+`runner.py`, following the same task-id boundary that already governs script/analyst-log
+accumulation rather than introducing a separate persistence concept:
+
+- Scoped by `Memory(store=FileStore(str(memory_dir)), namespace=skill_path.name,
+  agent_name=task_id)` — every operation is scope-prefixed server-side by `<skill>/<task_id>`
+  (verified against the library source: a defensive `RuntimeError` guards against a backend ever
+  returning a path outside the requested scope), so one shared store root safely hosts every
+  task's notebook. A fresh pristine `task-<uuid4>` gets an empty notebook as a structural
+  consequence, not a special case.
+- The `Memory` capability is nonetheless **omitted entirely** in pristine mode (not merely
+  `inject_memory=False`) — an empty notebook is harmless, but the tools/guidance text it adds
+  would still change pristine's tool surface and prompt token count, undermining
+  `compare_models.sh`'s apples-to-apples comparisons across models.
+- Backed by `FileStore` (plain Markdown + a hidden SQLite journal), matching this project's
+  "files are the source of truth" stance, at a new flat sibling `workspace/memory/<skill>/<task>/`
+  — never mounted into the Monty sandbox, so `run_code`/pathlib can't reach it; the `MemoryToolset`
+  is native, the same category as `FileSystem`'s tools.
+- `memory` added to `RESERVED_TASK_NAMES`; `memory_dir` created and `chmod 0o700`'d at startup,
+  before `Memory`/`FileStore` ever touch disk (the store's own lazy `mkdir` never chmods).
+
+**Verified live** against `google:gemini-3-flash-preview` and `google:gemini-3.5-flash`:
+- Accumulate mode (`--task memory-test`, three runs): first run created no memory file (agent
+  wasn't prompted to); a second, explicit prompt ("write a short note... using write_memory")
+  produced `workspace/memory/suricata-analyst/memory-test/MEMORY.md` (0600, under the 0700
+  `memory/` tree) with the expected content; a third run recalled the persisted fact verbatim
+  from the bounded injection without re-reading any file.
+- Pristine mode, both models: startup print showed `memory: disabled (pristine)`; zero
+  `workspace/memory/suricata-analyst/task-<uuid>/` directories were created; zero
+  `read_memory`/`write_memory`/`search_memory` tool calls appeared in either transcript or audit
+  `.jsonl`.
+- `--task memory` correctly rejected the same way `--task logs` already is.
+
+**Docs:** Updated `refs/workspace-lifecycle.md` (three domains → four, a fifth non-filesystem
+access point, updated diagrams/worked examples/open items) and `ARCHITECTURE.md`/`README.md` to
+match. `refs/workspace-lifecycle.md` remains the design source of truth.
+
+**Result:** Accumulate-mode tasks now carry forward model-curated notes across runs, bounded and
+automatically injected rather than depending on the agent's initiative to re-read old
+`analyst_log-*.md` files; `--pristine` and `compare_models.sh` are structurally unaffected — the
+capability doesn't exist for those runs at all, not just an empty one.

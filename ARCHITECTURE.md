@@ -22,36 +22,49 @@ flowchart TB
         FS["FileSystem capability"]
         CM["CodeMode capability"]
         Think["Thinking capability (optional)"]
-        Workspace[("Workspace (on disk)")]
+        Mem["Memory capability\n(accumulate mode only)"]
+        TaskWs[("Task workspace\nworkspace/<task>/")]
+        Data[("Input data (read-only)\nworkspace/data/")]
+        Logs[("Audit log (host-only)\nworkspace/logs/")]
+        MemStore[("Memory notebook\nworkspace/memory/<skill>/<task>/")]
         Monty["Monty sandbox"]
-        Artifacts["Artifacts:\nrunner-*.log\nanalyst_log-*.md\ngenerated_code/*.py"]
+        Artifacts["Artifacts:\nanalyst_log-*.md\ngenerated_code/*.py"]
 
         Skill -- "instructions" --> Agent
         Agent --> FS
         Agent --> CM
         Agent -.-> Think
-        FS -- "native calls" --> Workspace
+        Agent -.-> Mem
+        FS -- "native calls (task-scoped root)" --> TaskWs
         CM --> Monty
-        Monty -- "mount /workspace (rw)" --> Workspace
+        Mem -- "native calls + bounded injection\n(scoped to <skill>/<task>, never mounted)" --> MemStore
+        Monty -- "mount /workspace (rw)" --> TaskWs
+        Monty -- "mount /data (ro)" --> Data
         Monty -- "mount /skill (ro)" --> Skill
         Agent -- "writes" --> Artifacts
+        Artifacts -.-> TaskWs
+        Agent -. "run_start/prompt/tool/error/run_end events\n(host writes directly, never agent-visible)" .-> Logs
     end
 
-    Agent -. "optional" .-> Logfire["Logfire (traces)"]
+    Agent -. "optional" .-> Logfire["Logfire (traces, task_id/run_id metadata)"]
 ```
 
 ### Runner (`runner.py`)
 
-The only long-lived process. It has four responsibilities, and nothing else:
+The only long-lived process. It has five responsibilities, and nothing else:
 
-1. **Assembles** a skill's instructions + shared runtime notes into one system prompt, and wires
+1. **Resolves the task** for this run — a named `--task` (accumulate), an auto-generated
+   `--pristine` id, or the shared `default` — and derives the task-scoped workspace root from it.
+   See "Task-scoped workspaces" below.
+2. **Assembles** a skill's instructions + shared runtime notes into one system prompt, and wires
    up the agent's capabilities.
-2. **Drives** the agent loop (`agent.run_sync`), including the optional interactive
+3. **Drives** the agent loop (`agent.run_sync`), including the optional interactive
    checkpoint/continuation loop.
-3. **Persists** everything the run produced — transcript, generated code, final report — as
+4. **Persists** everything the run produced — audit log, generated code, final report — as
    plain files, independent of whether the model chose to save anything itself.
-4. **Maintains** the workspace between runs: linting previously-saved scripts for sandbox
-   incompatibilities, and telling the agent what already exists there before it starts.
+5. **Maintains** the task workspace between runs: linting previously-saved scripts for sandbox
+   incompatibilities, and telling the agent what already exists there (and what input files are
+   available) before it starts.
 
 It contains no analysis logic itself — it never parses a log file or knows what a "suspicious
 SNI" is. All domain knowledge lives in skills.
@@ -77,7 +90,7 @@ prefix). The runner has no knowledge of either skill's domain — it only knows 
 ### Shared runtime notes (`prompts/sandbox_notes.md`)
 
 Instructions that are true for *every* skill because they describe the execution environment,
-not any log format: sandbox constraints, the three path namespaces, the script-reuse mechanism,
+not any log format: sandbox constraints, the four path namespaces, the script-reuse mechanism,
 artifact-naming conventions. This is prepended to every skill's own instructions at load time so
 each skill only has to document what's actually specific to it — the alternative (repeating
 sandbox mechanics inside every `SKILL.md`) is exactly the duplication this file exists to avoid.
@@ -91,11 +104,14 @@ manages by hand.
 
 ### Capabilities
 
-Three capabilities compose to define what the agent can actually do, each independent of the
+Up to four capabilities compose to define what the agent can actually do, each independent of the
 others:
 
-- **`FileSystem`** — ordinary, native tools (list/read/write/search) scoped to the workspace
-  directory. This is how the agent inspects and persists artifacts without writing code.
+- **`FileSystem`** — ordinary, native tools (list/read/write/search) scoped to the current task's
+  workspace directory (`workspace/<task>/`), never the workspace base. This is how the agent
+  inspects and persists artifacts without writing code — and, structurally, it cannot see
+  `workspace/data/` or `workspace/logs/` or any other task's directory, because its root never
+  points above `workspace/<task>/`.
 - **`CodeMode`** — replaces however many tools would otherwise be sandboxed with a single
   `run_code` tool that accepts Python source. In this system it sandboxes *zero* of the other
   tools (`FileSystem`'s tools stay native); `run_code` exists purely as a Python execution
@@ -104,6 +120,15 @@ others:
 - **`Thinking`** (conditional) — requests extended reasoning from the model. Unlike the other
   two, it doesn't gate or wrap anything else; it's purely additive and only present when
   requested.
+- **`Memory`** (accumulate mode only) — a persistent, per-`<skill>/<task>` `MEMORY.md` notebook,
+  auto-injected into every model request (bounded, ~2k tokens) plus `read_memory`/`write_memory`/
+  `search_memory` tools for longer topic files. Backed by `pydantic_ai_harness.memory.FileStore`,
+  rooted at `workspace/memory/` — never mounted into the sandbox and never rooted by
+  `FileSystem`, so it's reachable only through its own native tools, the same way `FileSystem`'s
+  tools stay native rather than routing through `CodeMode`. Omitted entirely (not merely given an
+  empty notebook) in pristine mode, so a pristine run's tool surface and prompt token count are
+  identical regardless of whether the same task was ever run before — see "Workspace" below and
+  `refs/workspace-lifecycle.md`.
 
 ### Monty sandbox
 
@@ -112,8 +137,9 @@ a from-scratch Python-subset interpreter (not a subprocess or container) with it
 checker, a fixed importable stdlib subset, no class definitions, and no host filesystem/env/clock
 access except what's explicitly granted. Two things are granted, each independently:
 
-- **Mounted directories** — the workspace (read-write) and the current skill's own directory
-  (read-only). These are the *only* two paths reachable from inside sandboxed code.
+- **Mounted directories** — the task workspace (read-write), the case's input data (read-only),
+  and the current skill's own directory (read-only). These are the *only* three paths reachable
+  from inside sandboxed code.
 - **OS access** — environment variables are scrubbed to empty; the host clock is exposed (needed
   for timestamped filenames).
 
@@ -122,18 +148,59 @@ fall back on.
 
 ### Workspace
 
-The one stateful, shared location in the whole system, and the join point between three
-different views of the same directory:
+`--workspace` (default `./workspace`) is the case root, containing four domains — see
+[`refs/workspace-lifecycle.md`](refs/workspace-lifecycle.md) for the full design this section
+summarizes:
 
-- `FileSystem` tools see it as their root (relative paths).
-- `run_code` sees it mounted at `/workspace` (read-write).
-- The host process sees it as an ordinary directory it reads/writes directly (transcript,
-  generated code, reports).
+- **`data/`** — canonical, caller-supplied input evidence. Read-only, shared across tasks
+  (including pristine ones), mounted at `/data`. Not agent state.
+- **`<task>/`** — the one stateful, agent-writable directory, and the join point between three
+  different views of the same directory: `FileSystem` tools see it as their root (relative
+  paths), `run_code` sees it mounted at `/workspace` (read-write), and the host process reads/
+  writes it directly (generated code, reports). Which task directory is selected — a shared
+  `default`, a named `--task` that accumulates, or a fresh `--pristine` one — is resolved once at
+  startup. It also carries state *across* runs: prior `analyst_log-*.md` reports and
+  previously-saved `<prefix>_*.py` scripts left by earlier sessions in the *same* task are
+  discovered and surfaced to the agent at the start of each new run, so investigations accumulate
+  rather than restarting cold every time — unless a fresh `--pristine` task was requested.
+- **`memory/`** — a flat, per-`<skill>/<task>` notebook domain, nested one level deeper than
+  `logs/` (by skill, then task). Agent-authored, like reusable scripts, but reachable only
+  through the `Memory` capability's own tools and its bounded automatic injection — never through
+  `FileSystem` or a mount. Accumulates identically to scripts in accumulate mode; the capability
+  is omitted entirely in pristine mode, so no scope for that task ever exists.
+- **`logs/`** — a flat, host-only audit domain (see below), a sibling of the task directories and
+  therefore outside every task's writable root.
 
-It also carries state *across* runs, not just within one: prior `analyst_log-*.md` reports and
-previously-saved `<prefix>_*.py` scripts left by earlier sessions are discovered and surfaced to
-the agent at the start of each new run, so investigations accumulate rather than restarting cold
-every time.
+The isolation guarantee — an agent in one task can never read another task's directory or the
+audit log — holds only because the task root stays a validated, real, direct child of the
+workspace base; see `refs/workspace-lifecycle.md` for the invariants a future refactor must
+preserve. `Memory`'s scope isolation is a separate, complementary guarantee: every operation is
+prefixed server-side by `<skill>/<task_id>`, so one shared store root can't leak notes across
+tasks even though it isn't filesystem-mount-based like the other three domains.
+
+### Audit log (`workspace/logs/`)
+
+An append-only, host-only JSON Lines event stream, one file per run
+(`runner-<task>-<run-id>.jsonl`), a flat sibling of the task directories — not nested inside any
+of them, which is what keeps it unreachable through `FileSystem` or the sandbox's mounts. Unlike
+the old console transcript it replaces, events (configuration, prompts, every tool call/result,
+`run_code` bodies and returns, errors, completion) are flushed as they happen via pydantic-ai's
+`event_stream_handler`, so a failed or interrupted run still leaves a complete record.
+
+Two hardening details address the "Retention and permissions" open item in
+`refs/workspace-lifecycle.md`:
+
+- **Permissions.** `workspace/logs/` is `chmod 0700` and each `.jsonl` file `0600` at creation,
+  re-applied on every run rather than only on first creation, since audit records can contain
+  prompts, tool data, generated code, model responses, and reasoning — the umask defaults
+  (`0755`/`0644`) are not restrictive enough for that on their own.
+- **SIGTERM.** A `Ctrl+C` (`KeyboardInterrupt`) already unwinds through Python's normal
+  `finally`, so `run_end` gets written. A hard `SIGTERM` (e.g. a process manager's timeout, not a
+  user's interactive interrupt) previously did not — Python installs no default handler for it,
+  so the process died before the audit log closed. `runner.py` now converts `SIGTERM` into a
+  catchable `RunInterrupted` exception, which the `finally` block treats the same way, and exits
+  `143` (the standard `128 + SIGTERM` code) to signal the process was terminated. `SIGKILL`
+  remains uncatchable by any process — an OS-level limit, not something this addresses.
 
 ### Observability (Logfire, optional)
 
@@ -151,30 +218,41 @@ between them:
 ```mermaid
 flowchart LR
     subgraph HostProc["Host process — full OS access"]
-        H1["reads/writes workspace directly"]
+        H1["reads/writes task workspace directly"]
         H2["reads skill directory"]
         H3["real env vars, real network"]
-        H4["writes transcript / report / generated_code"]
+        H4["writes audit log / report / generated_code"]
+        H5["reads workspace/logs/ (audit) —\nnever exposed to agent"]
     end
 
     subgraph Sandbox["Monty sandbox — near-zero ambient access"]
-        S1["pathlib reachable ONLY under:\n/workspace (rw) · /skill (ro)\n(elsewhere: hard error, not silent no-op)"]
+        S1["pathlib reachable ONLY under:\n/workspace (rw, task-scoped) · /data (ro) · /skill (ro)\n(elsewhere: hard error, not silent no-op)"]
         S2["os.environ = {} — no host secrets"]
         S3["clock passes through (for filenames)"]
         S4["no sockets, no third-party imports,\nno class definitions, no exec/eval"]
     end
 
-    HostProc -- "mount: /workspace (rw)" --> Sandbox
+    HostProc -- "mount: /workspace (rw, workspace/<task>/)" --> Sandbox
+    HostProc -- "mount: /data (ro, workspace/data/)" --> Sandbox
     HostProc -- "mount: /skill (ro)" --> Sandbox
 ```
 
 `FileSystem` tool calls never cross into the sandbox at all — they're native calls the model
-issues directly against the host-side workspace path. `run_code` is the only surface that
+issues directly against the host-side task workspace path. `run_code` is the only surface that
 crosses into the sandbox, and everything it can touch is enumerated above. There is no path by
-which model-generated code reaches host secrets, the network, or any file outside the two
-mounted directories, regardless of what the model's own instructions or the user's prompt ask
-for — the guarantee is structural (interpreter + mount table), not something a skill's wording
-could accidentally weaken.
+which model-generated code reaches host secrets, the network, another task's directory,
+`workspace/logs/`, or any file outside the three mounted directories, regardless of what the
+model's own instructions or the user's prompt ask for — the guarantee is structural (interpreter
++ mount table + task-root validation), not something a skill's wording could accidentally weaken.
+See "Isolation guarantee" in `refs/workspace-lifecycle.md` for the specific invariants this
+depends on (validated task roots, reserved names, no symlink/traversal task ids).
+
+`Memory` (when attached) is a second native, non-sandboxed surface alongside `FileSystem` — the
+model reaches `workspace/memory/<skill>/<task>/` only through its own tool calls and automatic
+injection, never through a mount, so it doesn't add a fourth sandbox mount to the diagram above.
+Its isolation instead comes from server-side scope prefixing (`<skill>/<task_id>`), enforced by
+the store itself rather than by `pathlib`/mount-table restriction — the same class of guarantee,
+different mechanism.
 
 ## Extension points
 

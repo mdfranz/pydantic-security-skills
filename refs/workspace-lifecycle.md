@@ -31,9 +31,9 @@ interpreter-state serialization is involved.
   `MontyRepl`, no cross-call in-memory state.
 - No Monty snapshotting for persistence (see Appendix).
 
-## Three domains
+## Four domains
 
-Every file belongs to one of three domains, which decides whether and how the agent can see it:
+Every file belongs to one of four domains, which decides whether and how the agent can see it:
 
 | Artifact | Domain | Written by | Location | Agent-visible? |
 |---|---|---|---|---|
@@ -41,6 +41,7 @@ Every file belongs to one of three domains, which decides whether and how the ag
 | Reusable `<prefix>_*.py` scripts | Agent | The agent itself, via `FileSystem.write_file` mid-run | `workspace/<task>/` | yes — the runner injects a listing of these into the next run's prompt, unconditionally |
 | `analyst_log-*.md` analysis reports | Agent | The runner, assembled from the completed conversation *after* the run ends | `workspace/<task>/` | yes, but only if the agent finds it — reachable via `list_directory`/`read_file`, never injected into the prompt |
 | `generated_code/*.py` (run_code copies) | Agent | The runner, one file per `run_code` call, written *after* the run ends | `workspace/<task>/` | yes, but only if the agent finds it — same as above; this is an unconditional capture of every `run_code` call regardless of success, not something the agent chose to save |
+| `MEMORY.md` + topic files | Memory | The agent, via the `write_memory` tool (mediated by the `Memory` capability, not `FileSystem`) | `workspace/memory/<skill>/<task>/` | yes, but never through the filesystem — only via `write_memory`/`read_memory`/`search_memory`/`delete_memory` and a bounded automatic injection into every model request; never `list_directory`/`read_file` or any mount |
 | `runner-<task>-<run-id>.jsonl` audit record | Host audit | The runner, incrementally as the run progresses | `workspace/logs/` (flat) | **no** |
 
 **Input domain** = canonical source evidence supplied by the operator. It lives in
@@ -69,6 +70,19 @@ runner-guaranteed, until/unless the inventory injection is extended to cover the
 > writes to it, and it lives outside `workspace/` entirely (`skills/<name>/`). It is unaffected
 > by task scoping and out of scope for this doc, but it is the reason the isolation guarantee
 > below counts *four* access points, not three.
+
+**Memory domain** = a persistent, per-`<skill>/<task>` notebook (`MEMORY.md` plus any topic files
+the agent chooses to split out), stored as plain Markdown under `workspace/memory/`. It is
+agent-authored like the reusable-script part of the Agent domain, but its visibility model is
+different: it is never mounted into the sandbox and never rooted by `FileSystem`, so the agent can
+only reach it through the `Memory` capability's own tools (`write_memory`, `read_memory`,
+`search_memory`, `delete_memory`) and a bounded automatic injection into every model request —
+never through file listing or a path the agent supplies. It accumulates identically to reusable
+scripts in accumulate mode, scoped to `<skill>/<task_id>` so different tasks never share a
+notebook. In pristine mode the `Memory` capability is omitted entirely (not merely pointed at an
+empty scope), so a pristine run's tool surface and prompt token count stay identical across models
+— see *Isolation guarantee* below and `scripts/compare_models.sh`, whose entire purpose depends on
+that.
 
 **Host audit domain** = an append-only event record *about* the run, not an input to it. Today a
 console transcript is written into the task workspace, which means the agent can `read_file()`
@@ -100,7 +114,9 @@ The task name is resolved once at startup:
 - **Pristine starts with no prior agent state.** A full UUID4 is generated and its directory is
   created exclusively, retrying on the vanishingly unlikely collision. It contains no prior
   scripts, reports, generated code, or task-local outputs. It can still read the intentional,
-  read-only evidence in `/data`.
+  read-only evidence in `/data`. The `Memory` capability itself is omitted for the run (not
+  merely pointed at an empty scope), so pristine never carries memory-tool overhead into the
+  prompt or tool surface either.
 
 ### Task-id rules
 
@@ -124,6 +140,17 @@ The agent touches the filesystem through four access points, and none of them ca
 - `MountDir("/skill", skills/<name>/, read-only)` — a read-only mount of the current skill dir,
   which lives outside `workspace/` entirely, so it can never expose anything under `workspace/`.
 
+**A fifth, non-filesystem access point: the `Memory` capability.** When enabled (accumulate mode
+only — see below), the agent additionally reaches `workspace/memory/<skill>/<task>/` through the
+`Memory` capability's native tools and its automatic injection — never through `FileSystem`, a
+mount, or any path the agent supplies. Every operation is scoped server-side by
+`<namespace>/<agent_name>` (here, `<skill>/<task_id>`), and the store defensively raises if a
+backend implementation ever returns a path outside that scope. `workspace/logs/` and every other
+task's memory scope stay unreachable through this channel for the same reason `workspace/logs/`
+stays unreachable through the four filesystem access points below: the scope prefix, like the task
+root, is never a value the agent supplies. Omitted entirely in pristine mode, so a pristine run has
+no fifth access point at all.
+
 The two writable workspace-side access points are scoped to `workspace/<task>/`; `/data` grants
 only read access to the dedicated input directory; and the skill mount is outside `workspace/`
 altogether. Thus anything else under `workspace/`, including `workspace/logs/` and every other
@@ -141,8 +168,8 @@ task directory, is unreachable. Four conditions keep this true:
    (`analyst_log-*.md`, `generated_code/`). The filesystem tool correctly rejects traversal
    *below* its root, but cannot make an unsafe root safe — and the host-side `Path.write_text()`
    calls get no such protection at all, so they depend entirely on this upstream validation.
-4. **`data`, `logs`, and `default` are reserved task names.** They are siblings of task dirs and
-   must never be selected as a task root.
+4. **`data`, `logs`, `memory`, and `default` are reserved task names.** They are siblings of task
+   dirs and must never be selected as a task root.
 
 ## Directory layout
 
@@ -157,6 +184,13 @@ workspace/                                # base (--workspace, default ./workspa
       25-07-18_...-01.py
   suricata-triage/                        # --task suricata-triage (reused = accumulate)
   task-9f2a1c7b4e0d-.../                  # --pristine (fresh each time)
+  memory/                                 # reserved; per-(skill,task) notebooks  ← tool-visible only, never via FileSystem
+    .memory-store.sqlite3                 # FileStore's own bookkeeping journal, not a memory file
+    suricata-analyst/
+      default/
+        MEMORY.md
+      suricata-triage/
+        MEMORY.md
   logs/                                   # reserved; flat; host audit  ← NOT agent-visible
     runner-default-<run-id>.jsonl         # task name is in the filename
     runner-suricata-triage-<run-id>.jsonl
@@ -166,6 +200,11 @@ workspace/                                # base (--workspace, default ./workspa
 `logs/` is flat — one append-only JSON Lines event stream per run, with the task id and unique
 run id in the filename — so an audit record maps one-to-one to its task without nesting. It sits
 beside the task dirs, not inside any of them, which is what keeps it out of the agent's reach.
+
+`memory/` is a flat sibling too, but nested one level deeper than `logs/` — by skill, then task —
+since a single `Memory` store root hosts every skill's and task's notebook, each isolated by its
+own `<skill>/<task>` scope prefix (see *Isolation guarantee*). No `--pristine` task ever appears
+under it, since the capability is omitted for pristine runs entirely.
 
 ## Worked examples
 
@@ -186,6 +225,10 @@ workspace/
     analyst_log-25-07-18_14-02-11.md
     generated_code/
       25-07-18_14-02-11-01.py
+  memory/
+    suricata-analyst/
+      default/
+        MEMORY.md                        # only if the agent chose to write_memory this run
   logs/
     runner-default-<run-id>.jsonl        # agent cannot reach this
 ```
@@ -205,12 +248,18 @@ workspace/
     generated_code/
       25-07-18_14-02-11-01.py
       25-07-19_09-15-40-01.py            # ← new
+  memory/
+    suricata-analyst/
+      default/
+        MEMORY.md                        # ← grows in place across both runs, same scope
   logs/
     runner-default-<first-run-id>.jsonl
     runner-default-<second-run-id>.jsonl # ← new
 ```
 
-The agent starts run #2 seeing `suricata_extract_sni.py` and the earlier `analyst_log`.
+The agent starts run #2 seeing `suricata_extract_sni.py` and the earlier `analyst_log`, plus
+whatever `MEMORY.md` already held from run #1, bounded-injected automatically this time instead
+of requiring the agent to go read `analyst_log-25-07-18_14-02-11.md` itself.
 
 ### 3. `--task suricata-triage` → named, reusable (isolated from `default`)
 
@@ -245,12 +294,19 @@ workspace/
     analyst_log-25-07-19_11-45-22.md
     generated_code/
       25-07-19_11-45-22-01.py
+  memory/                                # ← unchanged; no suricata-analyst/task-9f2a1c7b4e0d-... entry
+    suricata-analyst/                    #   at all -- the Memory capability was omitted for this run,
+      default/                           #   not merely pointed at an empty scope
+        MEMORY.md
   logs/
     runner-task-9f2a1c7b4e0d-...-<run-id>.jsonl
 ```
 
 Rerunning `--pristine` yields a different UUID directory. Nothing is deleted; the old task is
 not selected automatically, though it can be deliberately reopened with `--task <generated-id>`.
+Reopening it *would* attach `Memory` (accumulate mode again), scoped to that same
+`task-9f2a1c7b4e0d-...` id — but no `MEMORY.md` would exist yet, since the pristine run that
+created the directory never had the capability attached to write one.
 
 ### 5. Custom base
 
@@ -294,11 +350,12 @@ discovery. No change to Monty's execution model is required.
   `<workspace-base>/data/`. No `--results` arg — audit lives under the workspace base.
 - **Task resolution:** compute `task_id` from the table above (error if `--task` and `--pristine`
   are both set; generate `task-<full-uuid4>` for pristine, creating its directory exclusively).
-  User task names must match the task-id rule; reserve `default`, `data`, and `logs`.
+  User task names must match the task-id rule; reserve `default`, `data`, `logs`, and `memory`.
 - **Path derivation:**
   - `ws_path = <workspace-base>/<task_id>`  (mounted + `FileSystem` root, as today)
   - `data_dir = <workspace-base>/data`  (mounted at `/data`, read-only)
   - `logs_dir = <workspace-base>/logs`  (flat; created once)
+  - `memory_dir = <workspace-base>/memory`  (flat; created once; never mounted)
 - **Validate paths before mounting:** resolve the base once, ensure the selected task root is a
   real direct child rather than a symlink, and use that validated path for both `FileSystem` and
   `MountDir`.
@@ -315,15 +372,25 @@ discovery. No change to Monty's execution model is required.
 - **Input discovery:** update shared sandbox notes and skills: input files are listed by the
   runner from `data_dir` at startup and read in `run_code` as `/data/<filename>`; all agent
   outputs continue to use `/workspace`.
+- **Memory:** attach `pydantic_ai_harness.memory.Memory(store=FileStore(str(memory_dir)),
+  namespace=skill_path.name, agent_name=task_id)` to `capabilities` in accumulate mode, scoping
+  the notebook to `<skill>/<task_id>` — the same boundary that already governs script/analyst-log
+  accumulation. `memory_dir` is created and `chmod 0o700`'d once at startup, like `logs_dir`,
+  since notes can contain security-analysis findings; `FileStore` itself never chmods what it
+  lazily creates, so this must happen before the capability is ever exercised. In pristine mode
+  the capability is omitted entirely (not `inject_memory=False`), so `compare_models.sh`'s
+  pristine runs keep an identical tool surface and prompt token count across models — see
+  *Isolation guarantee* above.
 
 ### Behavior change to confirm
 
 `--workspace` changes meaning from "the agent workspace directory" to "the workspace
-**base/case root**." Its default layout is now `./workspace/data`, `./workspace/default`, and
-`./workspace/logs`; the agent's writable root is `./workspace/default`. Anyone currently passing
-`--workspace ./foo` will now get `./foo/data`, `./foo/default`, and `./foo/logs`. This is an
-intentional breaking layout change. No automatic migration is planned; legacy contents are left
-untouched and operators place current evidence under `data/`.
+**base/case root**." Its default layout is now `./workspace/data`, `./workspace/default`,
+`./workspace/memory`, and `./workspace/logs`; the agent's writable root is `./workspace/default`.
+Anyone currently passing `--workspace ./foo` will now get `./foo/data`, `./foo/default`,
+`./foo/memory`, and `./foo/logs`. This is an intentional breaking layout change. No automatic
+migration is planned; legacy contents are left untouched and operators place current evidence
+under `data/`.
 
 ## Open items
 
@@ -331,6 +398,10 @@ untouched and operators place current evidence under `data/`.
   model responses, and reasoning. Set restrictive host permissions and define size/age retention
   before enabling this on sensitive or long-lived cases. Pristine task directories also persist;
   cleanup, if wanted, must be a separate explicit action.
+- **Memory retention:** `workspace/memory/<skill>/<task>/` persists indefinitely per accumulate
+  task and is not covered by any retention/rotation policy; treat it with the same sensitivity as
+  `analyst_log-*.md` — an operator can read it directly, but the agent cannot browse it via
+  `FileSystem`, only through the `Memory` capability's own tools.
 - **Concurrent reuse:** no task-level locking is proposed now. Every run still receives a unique
   `run_id` and exclusive audit filename so ordinary timestamp collisions cannot merge or
   overwrite audit records. Concurrent writes to the same accumulated task remain unsupported.

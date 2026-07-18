@@ -9,28 +9,37 @@ not any particular log format. Skill-specific instructions follow after this sec
 Generated code runs in the Monty sandbox, not host Python: no third-party imports and only
 `sys`, `typing`, `asyncio`, `math`, `json`, `re`, `datetime`, `os`, `pathlib` are available (no
 `collections`, no `orjson`/`polars`/`duckdb`). There is no `open()` builtin — use `pathlib.Path`
-instead. The workspace is mounted read-write at `/workspace`, so any files written with
-`write_file` are reachable at `/workspace/<name>` from sandboxed code — do not assume a fixed
-input filename; always confirm it first (see the skill's own "Find the input file" step). The
-skill's own directory is separately mounted **read-only** at `/skill`, so its reference material
-lives at `/skill/references/<name>` — readable from `run_code` only, since the FileSystem tool's
-root is the workspace, not the skill directory.
+instead. This run has its own task workspace, mounted read-write at `/workspace`, so any files
+written with `write_file` are reachable at `/workspace/<name>` from sandboxed code — this is
+where you save reusable scripts, reports, and other output; it accumulates or resets per the
+runner's task mode, but it never contains the case's input evidence. Canonical input evidence
+(the logs you're asked to analyze) is separately mounted **read-only** at `/data` — the runner
+lists what's there at the start of your prompt (as `/data/<filename>`); use those exact paths in
+`run_code`, and do not assume a fixed input filename. The skill's own directory is also mounted
+**read-only**, at `/skill`, so its reference material lives at `/skill/references/<name>` —
+readable from `run_code` only, since the FileSystem tool's root is the task workspace, not the
+skill directory or `/data`.
 
-Three different path namespaces are in play — do not mix them up:
-- **`run_code` (Monty sandbox), workspace mount**: paths are absolute against the mount, e.g.
-  `/workspace/<filename>`.
+Four different path namespaces are in play — do not mix them up:
+- **`run_code` (Monty sandbox), workspace mount**: read-write, absolute against the mount, e.g.
+  `/workspace/<filename>`. This is where you write scripts and other output — never input data.
+- **`run_code` (Monty sandbox), data mount**: read-only, e.g. `/data/<filename>`. This is where
+  case input evidence lives; the runner tells you what's there at the start of your prompt.
+  Writes here fail.
 - **`run_code` (Monty sandbox), skill mount**: read-only, e.g. `/skill/references/<name>`. Writes
   here fail — this mount exists for reading reference material, not saving anything.
 - **`list_directory` / `read_file` / `write_file` (FileSystem tool)**: paths are relative to the
-  workspace root itself, e.g. `list_directory(path='.')` or `write_file('notes.md', ...)`. Passing
-  `/workspace` (or `/skill`) to these tools fails with "Path resolves outside the root directory" —
-  those prefixes are only meaningful inside `run_code`.
+  task workspace root itself, e.g. `list_directory(path='.')` or `write_file('notes.md', ...)`.
+  This tool can only reach the task workspace — it cannot see `/data` or `/skill` at all, so use
+  `run_code` (not this tool) to discover or read input files. Passing `/workspace`, `/data`, or
+  `/skill` to this tool fails with "Path resolves outside the root directory" — those prefixes
+  are only meaningful inside `run_code`.
 
 File objects from `pathlib.Path(...).open()` do **not** support `for line in f:` — that raises
 `TypeError: '_io.TextIOWrapper' object is not iterable`. Always read line-by-line with an explicit
 loop instead:
 ```python
-f = pathlib.Path("/workspace/<filename>").open()
+f = pathlib.Path("/data/<filename>").open()
 while True:
     line = f.readline()
     if not line:

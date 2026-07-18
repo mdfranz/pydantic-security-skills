@@ -1,22 +1,41 @@
 import argparse
 import json
-import logging
 import re
+import signal
 import sys
 import textwrap
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import Thinking
-from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart, ThinkingPart
+from pydantic_ai.messages import (
+    FunctionToolCallEvent,
+    FunctionToolResultEvent,
+    ModelRequest,
+    ModelResponse,
+    PartEndEvent,
+    TextPart,
+    ThinkingPart,
+    ToolCallPart,
+    ToolReturnPart,
+)
 from pydantic_ai.profiles.anthropic import ANTHROPIC_THINKING_BUDGET_MAP
 from pydantic_ai_harness import CodeMode, FileSystem
+from pydantic_ai_harness.memory import FileStore, Memory
 from pydantic_monty import MountDir, OSAccess
 
 SANDBOX_WORKSPACE_MOUNT = "/workspace"
 SANDBOX_SKILL_MOUNT = "/skill"
+SANDBOX_DATA_MOUNT = "/data"
+
+# Task IDs are identifiers, not paths -- this rejects path separators, '.'/'..', absolute
+# paths, and filename injection into audit paths. See refs/workspace-lifecycle.md.
+TASK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+RESERVED_TASK_NAMES = {"default", "data", "logs", "memory"}
+DEFAULT_TASK_ID = "default"
 
 # Saved scripts are never executed as `python script.py` -- they're reused by pasting their
 # text into a run_code call, where they always run as a top-level snippet. __name__ is never
@@ -54,24 +73,141 @@ def lint_and_fix_scripts(ws_path: Path) -> None:
             )
 
 
-class TeeWriter:
-    """Write console output to both the terminal and the run transcript."""
+class TaskError(Exception):
+    """Raised for invalid --task/--pristine combinations or unsafe task roots."""
 
-    def __init__(self, console, transcript):
-        self.console = console
-        self.transcript = transcript
 
-    def write(self, data):
-        self.console.write(data)
-        self.transcript.write(data)
-        self.transcript.flush()
+class RunInterrupted(BaseException):
+    """Raised from the SIGTERM handler so termination unwinds through the normal
+    try/except/finally in main() -- like KeyboardInterrupt already does -- instead of the
+    process dying before the audit log's run_end event is written. A BaseException, not an
+    Exception, so it isn't mistaken for an application error. Can't help against SIGKILL,
+    which no process can catch; that's an OS-level limit, not something this handles."""
 
-    def flush(self):
-        self.console.flush()
-        self.transcript.flush()
 
-    def isatty(self):
-        return self.console.isatty()
+def _raise_on_sigterm(signum, frame):
+    raise RunInterrupted(f"received signal {signum}")
+
+
+def resolve_task_id(args: argparse.Namespace) -> tuple[str | None, str]:
+    """Resolve the task id and mode ('accumulate' or 'pristine') from CLI args.
+
+    Mirrors the table in refs/workspace-lifecycle.md: --task reuses a name (accumulate),
+    --pristine defers id generation to create_pristine_task_root (returned task_id is None
+    here -- the actual UUID4 is only minted once, at directory-creation time, so it can retry
+    on collision), neither falls back to 'default', and both together is an error (already
+    enforced by the argparse mutually-exclusive group, but checked again here in case this is
+    ever called with a hand-built namespace).
+    """
+    if args.task and args.pristine:
+        raise TaskError("--task and --pristine are mutually exclusive")
+    if args.pristine:
+        return None, "pristine"
+    if args.task:
+        if args.task in RESERVED_TASK_NAMES:
+            raise TaskError(f"'{args.task}' is a reserved task name")
+        if not TASK_ID_RE.match(args.task):
+            raise TaskError(f"task names must match {TASK_ID_RE.pattern}")
+        return args.task, "accumulate"
+    return DEFAULT_TASK_ID, "accumulate"
+
+
+def create_task_root(base: Path, task_id: str, *, exclusive: bool) -> Path:
+    """Resolve and create the task's workspace subdirectory, enforcing the isolation
+    guarantee in refs/workspace-lifecycle.md: the task root must be a real, direct child of
+    the (already-resolved) workspace base -- never a symlink, never a traversal target.
+
+    `exclusive=True` (pristine mode) requires the directory not already exist, retrying on
+    the vanishingly unlikely UUID4 collision. `exclusive=False` (accumulate) creates it if
+    missing and reuses it otherwise.
+    """
+    candidate = base / task_id
+    if candidate.exists() and (candidate.is_symlink() or not candidate.is_dir()):
+        raise TaskError(f"task root {candidate} exists and is not a plain directory")
+
+    if exclusive:
+        candidate.mkdir(parents=False)
+    else:
+        candidate.mkdir(parents=False, exist_ok=True)
+
+    resolved = candidate.resolve()
+    if resolved.parent != base:
+        raise TaskError(f"task root {resolved} is not a direct child of workspace base {base}")
+    return resolved
+
+
+def create_pristine_task_root(base: Path, *, max_attempts: int = 5) -> tuple[str, Path]:
+    """Generate a fresh task-<uuid4> id and create its directory exclusively, retrying on
+    the vanishingly unlikely name collision."""
+    last_error: Exception | None = None
+    for _ in range(max_attempts):
+        task_id = f"task-{uuid.uuid4()}"
+        try:
+            return task_id, create_task_root(base, task_id, exclusive=True)
+        except FileExistsError as e:
+            last_error = e
+            continue
+    raise TaskError(f"could not allocate a pristine task directory after {max_attempts} attempts") from last_error
+
+
+class AuditLog:
+    """Append-only JSON Lines event stream for a single run, written to workspace/logs/ --
+    a flat sibling of the task directories, outside the agent's reach. Richer than a console
+    transcript by design: every event is flushed as it happens, so a failed or interrupted
+    run still leaves a complete audit record. See refs/workspace-lifecycle.md."""
+
+    def __init__(self, logs_dir: Path, task_id: str, run_id: str):
+        self.path = logs_dir / f"runner-{task_id}-{run_id}.jsonl"
+        self._file = self.path.open("a", encoding="utf-8")
+        # Audit records can contain prompts, tool data, generated code, model responses, and
+        # reasoning -- restrict to the owner regardless of umask. See "Retention and
+        # permissions" in refs/workspace-lifecycle.md.
+        self.path.chmod(0o600)
+
+    def event(self, kind: str, **fields) -> None:
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": kind,
+            **fields,
+        }
+        self._file.write(json.dumps(record, default=str) + "\n")
+        self._file.flush()
+
+    def close(self) -> None:
+        self._file.close()
+
+
+def make_event_stream_handler(audit: AuditLog):
+    """Build an event_stream_handler that mirrors model responses and tool calls/results to
+    the audit log incrementally, as pydantic_ai emits them during agent.run_sync -- not just
+    reconstructed afterward from the finished conversation."""
+
+    async def handler(ctx, event_iter):
+        async for event in event_iter:
+            if isinstance(event, PartEndEvent):
+                part = event.part
+                if isinstance(part, TextPart) and part.content.strip():
+                    audit.event("model_text", content=part.content)
+                elif isinstance(part, ThinkingPart) and part.content.strip():
+                    audit.event("model_thinking", content=part.content)
+            elif isinstance(event, FunctionToolCallEvent):
+                part = event.part
+                args = part.args_as_dict() if part.args else None
+                if part.tool_name == "run_code":
+                    audit.event("run_code_call", tool_call_id=part.tool_call_id, code=(args or {}).get("code"))
+                else:
+                    audit.event(
+                        "tool_call", tool_call_id=part.tool_call_id, tool_name=part.tool_name, args=args
+                    )
+            elif isinstance(event, FunctionToolResultEvent):
+                part = event.part
+                tool_name = getattr(part, "tool_name", None)
+                content = getattr(part, "content", None)
+                kind = "run_code_return" if tool_name == "run_code" else "tool_result"
+                audit.event(kind, tool_call_id=part.tool_call_id, tool_name=tool_name, content=content)
+
+    return handler
+
 
 SANDBOX_NOTES_PATH = Path(__file__).parent / "prompts" / "sandbox_notes.md"
 
@@ -166,7 +302,27 @@ def main():
     )
     parser.add_argument("prompt", help="Query prompt for the agent")
     parser.add_argument("--model", default="google:gemini-3-flash-preview", help="Model ID")
-    parser.add_argument("--workspace", default="./workspace", help="Workspace path")
+    parser.add_argument(
+        "--workspace",
+        default="./workspace",
+        help="Workspace base/case root. Contains data/ (read-only input), logs/ (host audit, "
+        "not agent-visible), memory/ (per-task notebook, reachable only via the memory tools, "
+        "never through FileSystem), and one subdirectory per task (the agent's writable root).",
+    )
+    task_group = parser.add_mutually_exclusive_group()
+    task_group.add_argument(
+        "--task",
+        default=None,
+        help="Reuse (or create) a named task workspace -- accumulates across runs. Must match "
+        f"{TASK_ID_RE.pattern}; 'default', 'data', 'logs', and 'memory' are reserved. Defaults "
+        "to the shared 'default' task if neither --task nor --pristine is given.",
+    )
+    task_group.add_argument(
+        "--pristine",
+        action="store_true",
+        help="Start a fresh, isolated task workspace (auto-generated id) with no prior agent "
+        "state. The directory persists after the run but is never selected automatically again.",
+    )
     parser.add_argument("--debug", action="store_true", help="Print generated sandbox code and its result")
     parser.add_argument(
         "--logfire",
@@ -193,22 +349,67 @@ def main():
     )
     args = parser.parse_args()
 
-    ws_path = Path(args.workspace).resolve()
-    ws_path.mkdir(parents=True, exist_ok=True)
+    try:
+        task_id, mode = resolve_task_id(args)
+    except TaskError as e:
+        parser.error(str(e))
+
+    # Hoisted here (rather than loaded alongside the rest of the skill config, further down)
+    # because the memory scope, and the startup print below, both need it before that point.
+    skill_path = Path(args.skill_dir)
+
+    # Memory persists a per-task notebook exactly like scripts/analyst_logs already do, so it
+    # follows task_id/mode precisely: accumulate tasks get a growing notebook; a freshly minted
+    # pristine task_id gives an empty scope as a structural consequence, no special-casing
+    # needed for *emptiness*. But the capability itself is omitted entirely in pristine mode
+    # (not just pointed at an empty scope) -- see refs/workspace-lifecycle.md and
+    # compare_models.sh, which needs identical tool surface/prompt tokens across pristine runs
+    # of different models for a fair comparison.
+    memory_enabled = mode != "pristine"
+    memory_scope = f"{skill_path.name}/{task_id}" if memory_enabled else None
+
+    base_path = Path(args.workspace).resolve()
+    base_path.mkdir(parents=True, exist_ok=True)
+
+    data_dir = base_path / "data"
+    data_dir.mkdir(exist_ok=True)
+    logs_dir = base_path / "logs"
+    logs_dir.mkdir(exist_ok=True)
+    # Audit records under here can contain prompts, tool data, and model output -- restrict
+    # to the owner regardless of umask, on every run (not just first creation), so an
+    # externally loosened directory gets re-tightened rather than silently trusted.
+    logs_dir.chmod(0o700)
+
+    memory_dir = base_path / "memory"
+    memory_dir.mkdir(exist_ok=True)
+    # Memory notes can contain security-analysis findings -- same rationale as logs_dir above.
+    # Created and chmod'd here, not left to FileStore's own lazy mkdir (which never chmods), so
+    # the directory is owner-only before Memory/FileStore ever touch disk.
+    memory_dir.chmod(0o700)
+
+    try:
+        if mode == "pristine":
+            task_id, ws_path = create_pristine_task_root(base_path)
+        else:
+            ws_path = create_task_root(base_path, task_id, exclusive=False)
+    except TaskError as e:
+        parser.error(str(e))
 
     run_stamp = datetime.now().strftime("%y-%m-%d_%H-%M-%S")
-    transcript_path = ws_path / f"runner-{run_stamp}.log"
-    transcript_file = transcript_path.open("a", encoding="utf-8")
+    run_id = uuid.uuid4().hex
 
-    # Keep the interactive output while retaining the complete run for later
-    # inspection. This includes model responses, tool calls, and tool results.
-    sys.stdout = TeeWriter(sys.stdout, transcript_file)
-    sys.stderr = TeeWriter(sys.stderr, transcript_file)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[logging.FileHandler(transcript_path, mode="a", encoding="utf-8")],
+    audit = AuditLog(logs_dir, task_id, run_id)
+    print(
+        f"Task: {task_id} (mode: {mode}) -- workspace: {ws_path} -- "
+        f"memory: {memory_scope if memory_enabled else 'disabled (pristine)'}"
     )
+
+    # Converts SIGTERM into a normal Python exception so the finally block below still runs
+    # and writes run_end -- without this, a hard kill (e.g. a process manager's timeout, as
+    # opposed to Ctrl+C's KeyboardInterrupt, which Python already turns into an exception)
+    # terminates before the audit log is closed out. Registered only once audit exists, since
+    # there's nothing to flush before that point anyway.
+    signal.signal(signal.SIGTERM, _raise_on_sigterm)
 
     if args.logfire:
         try:
@@ -221,7 +422,6 @@ def main():
             print(f"Logfire not available: {e}")
             print("Continuing without Logfire tracing.")
 
-    skill_path = Path(args.skill_dir)
     config = load_skill(skill_path)
     skill_instructions = config.get("instructions", "You are a security analyst.")
     sandbox_notes = load_sandbox_notes()
@@ -250,12 +450,29 @@ def main():
                 # Read-only so generated code can consult a skill's reference material
                 # (e.g. references/*.md) without being able to modify the skill itself.
                 MountDir(SANDBOX_SKILL_MOUNT, str(skill_path.resolve()), mode="read-only"),
+                # Read-only canonical evidence, shared across tasks (including pristine ones).
+                # Not agent state -- never copied into a task workspace or writable by the agent.
+                MountDir(SANDBOX_DATA_MOUNT, str(data_dir), mode="read-only"),
             ],
             # Empty environ keeps host env vars isolated; only the host clock is exposed,
             # so generated code can timestamp filenames per the skill's naming convention.
             os_access=OSAccess(environ={}),
         ),
     ]
+
+    if memory_enabled:
+        capabilities.append(
+            Memory(
+                store=FileStore(str(memory_dir)),
+                # namespace/agent_name become a scope path segment (validated against
+                # [A-Za-z0-9_.-]) -- safe today since skill_path.name and task_id are both
+                # drawn from filesystem-safe names, but keep any future skill directory name
+                # within that charset or scope resolution raises unconditionally, before
+                # Memory's own injection_errors handling can apply.
+                namespace=skill_path.name,
+                agent_name=task_id,
+            )
+        )
 
     model_settings = {}
     if args.max_tokens is not None:
@@ -274,6 +491,9 @@ def main():
 
     agent = Agent(
         args.model,
+        # Stable logging identity independent of task id/mode -- a task-specific name would
+        # create unhelpful high-cardinality telemetry. task_id/run_id are attached per-run below.
+        name=skill_path.name,
         system_prompt=instructions,
         capabilities=capabilities,
         model_settings=model_settings or None,
@@ -281,20 +501,52 @@ def main():
 
     lint_and_fix_scripts(ws_path)
 
-    existing_scripts = sorted(p.name for p in ws_path.glob("*.py"))
     run_prompt = args.prompt
+
+    # Input files can't be discovered with the FileSystem tool (its root is the task
+    # workspace, not /data), so the runner surfaces the /data inventory directly in the prompt.
+    data_files = sorted(p.name for p in data_dir.iterdir() if p.is_file())
+    if data_files:
+        inventory = "\n".join(f"- {SANDBOX_DATA_MOUNT}/{name}" for name in data_files)
+        run_prompt = (
+            f"Input files available read-only at {SANDBOX_DATA_MOUNT} (use these exact paths "
+            f"in run_code):\n{inventory}\n\n{run_prompt}"
+        )
+        print(f"Found {len(data_files)} input file(s) in data: {', '.join(data_files)}")
+
+    existing_scripts = sorted(p.name for p in ws_path.glob("*.py"))
     if existing_scripts:
         inventory = "\n".join(f"- {name}" for name in existing_scripts)
         run_prompt = (
             "Reusable scripts already saved in the workspace from earlier sessions (read one "
             "with the FileSystem tool and adapt it before writing new analysis code from "
-            f"scratch, per the skill instructions):\n{inventory}\n\n{args.prompt}"
+            f"scratch, per the skill instructions):\n{inventory}\n\n{run_prompt}"
         )
         print(f"Found {len(existing_scripts)} existing script(s) in workspace: {', '.join(existing_scripts)}")
 
+    run_metadata = {"task_id": task_id, "run_id": run_id}
+    stream_handler = make_event_stream_handler(audit)
+    completed = False
+
+    audit.event(
+        "run_start",
+        task_id=task_id,
+        run_id=run_id,
+        mode=mode,
+        skill=skill_path.name,
+        model=args.model,
+        workspace=str(ws_path),
+        interactive=args.interactive,
+        thinking=args.thinking,
+        max_tokens=args.max_tokens,
+        memory_enabled=memory_enabled,
+        memory_scope=memory_scope,
+    )
+
     try:
         print(f"Running Pydantic AI agent on skill: {skill_path.name}")
-        result = agent.run_sync(run_prompt)
+        audit.event("prompt", prompt=run_prompt)
+        result = agent.run_sync(run_prompt, event_stream_handler=stream_handler, metadata=run_metadata)
         print_thinking(result)
         print("\n--- Agent Response ---")
         print(result.output)
@@ -320,7 +572,13 @@ def main():
                         "The user wants to continue. Proceed with the next phase of analysis you outlined. "
                         "After completing this phase, summarize what you found and ask if they want to continue further."
                     )
-                    result = agent.run_sync(continuation_prompt, message_history=result.all_messages())
+                    audit.event("prompt", prompt=continuation_prompt)
+                    result = agent.run_sync(
+                        continuation_prompt,
+                        message_history=result.all_messages(),
+                        event_stream_handler=stream_handler,
+                        metadata=run_metadata,
+                    )
                     print_thinking(result)
                     print("\n--- Analysis Continued ---")
                     print(result.output)
@@ -336,7 +594,13 @@ def main():
                             "Adjust your analysis to focus on this area specifically. After this analysis phase, "
                             "ask if they want to continue investigating other angles."
                         )
-                        result = agent.run_sync(continuation_prompt, message_history=result.all_messages())
+                        audit.event("prompt", prompt=continuation_prompt)
+                        result = agent.run_sync(
+                            continuation_prompt,
+                            message_history=result.all_messages(),
+                            event_stream_handler=stream_handler,
+                            metadata=run_metadata,
+                        )
                         print_thinking(result)
                         print("\n--- Focused Analysis ---")
                         print(result.output)
@@ -345,7 +609,7 @@ def main():
                     else:
                         print("Could not parse focus. Use 'continue', 'stop', or 'focus on <topic>'.")
 
-        # Save the full conversation and findings independently of the transcript
+        # Save the full conversation and findings independently of the audit log
         report_path = ws_path / f"analyst_log-{run_stamp}.md"
         conversation = format_conversation_history(result, run_prompt)
 
@@ -396,9 +660,22 @@ def main():
         # later in this session (or the next session's inventory) never sees a broken guard.
         lint_and_fix_scripts(ws_path)
 
+        completed = True
+
+    except RunInterrupted as e:
+        audit.event("interrupted", reason=str(e))
+        raise
+    except Exception as e:
+        audit.event("error", error=str(e), error_type=type(e).__name__)
+        raise
     finally:
-        transcript_file.flush()
-        transcript_file.close()
+        audit.event("run_end", status="completed" if completed else "failed")
+        audit.close()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RunInterrupted:
+        # Matches the shell's own SIGTERM exit-code convention (128 + 15) instead of a raw
+        # traceback -- the run_end/interrupted events are already written by main()'s finally.
+        sys.exit(143)
