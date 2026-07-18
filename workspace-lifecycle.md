@@ -1,0 +1,360 @@
+# Workspace Lifecycle: Task-Scoped Workspaces
+
+> Supersedes the earlier snapshot-focused draft of this file. Monty snapshotting is **not**
+> the mechanism used here — see the Appendix for why it was set aside.
+
+## Purpose
+
+Give the runner two workspace modes without changing anything about how the agent executes:
+
+- **Accumulate** — reuse a workspace across runs so investigations build on prior scripts and
+  analyses (today's behavior).
+- **Pristine** — start a fresh, isolated workspace that is guaranteed not to be polluted by
+  earlier runs.
+
+Both fall out of a single idea: **a task workspace is identified by a *task name*.** Reusing a
+name accumulates; a freshly generated name is pristine. The top-level `workspace/` directory is
+the case root: it also owns canonical, read-only input data and host-only audit records. No
+interpreter-state serialization is involved.
+
+## Goals / non-goals
+
+**Goals**
+- Per-run choice between accumulate and pristine.
+- Keep files as the source of truth (nothing depends on serialized in-memory state).
+- Stop the agent from seeing the host's own audit trail.
+- Keep canonical evidence separate from agent-produced state and make it read-only to the agent.
+- Retain a complete, durable audit record even when a run fails or is interrupted.
+
+**Non-goals**
+- No change to the execution model: `run_code` stays stateless top-level snippets. No
+  `MontyRepl`, no cross-call in-memory state.
+- No Monty snapshotting for persistence (see Appendix).
+
+## Three domains
+
+Every file belongs to one of three domains, which decides whether and how the agent can see it:
+
+| Artifact | Domain | Written by | Location | Agent-visible? |
+|---|---|---|---|---|
+| Caller-supplied evidence such as `eve.json` | Input | Operator, before the run | `workspace/data/` | yes — `/data`, read-only |
+| Reusable `<prefix>_*.py` scripts | Agent | The agent itself, via `FileSystem.write_file` mid-run | `workspace/<task>/` | yes — the runner injects a listing of these into the next run's prompt, unconditionally |
+| `analyst_log-*.md` analysis reports | Agent | The runner, assembled from the completed conversation *after* the run ends | `workspace/<task>/` | yes, but only if the agent finds it — reachable via `list_directory`/`read_file`, never injected into the prompt |
+| `generated_code/*.py` (run_code copies) | Agent | The runner, one file per `run_code` call, written *after* the run ends | `workspace/<task>/` | yes, but only if the agent finds it — same as above; this is an unconditional capture of every `run_code` call regardless of success, not something the agent chose to save |
+| `runner-<task>-<run-id>.jsonl` audit record | Host audit | The runner, incrementally as the run progresses | `workspace/logs/` (flat) | **no** |
+
+**Input domain** = canonical source evidence supplied by the operator. It lives in
+`workspace/data/`; the runner mounts it at `/data` read-only. It is intentionally shared between
+tasks, including pristine tasks, but it is not prior agent state. The agent must never modify it.
+
+**Agent domain** = everything produced during or about a task run that the agent may consume
+later — not necessarily everything the agent itself writes. Only the reusable scripts are
+agent-authored, via a mid-run tool call; the analysis reports and generated-code copies are
+written by the runner, after the run completes, from the finished conversation. All three still
+belong to this domain because visibility, not authorship, is what the domain boundary tracks:
+all three live in the task workspace, the only **writable** tree the agent can reach — mounted
+into the sandbox at `/workspace` (read-write) and exposed as the `FileSystem` root. This is what
+accumulates or resets. Input data is not copied into a task workspace, so large evidence files
+are not duplicated for every pristine run.
+
+Only the script inventory is a *guarantee* — the runner injects it into every prompt on reuse.
+Analysis reports and generated-code copies are merely *reachable*: the agent has to call
+`list_directory` and decide to read them. In practice it does (confirmed by this project's own
+telemetry — the agent has `read_file`'d prior `analyst_log-*.md` files across sessions), but
+nothing in the runner forces it, so treat "analyses accumulate" as agent-initiative-dependent, not
+runner-guaranteed, until/unless the inventory injection is extended to cover them too.
+
+> A fourth mount — the current skill directory at `/skill` (read-only) — is a
+> *read-only input*, not an artifact domain: the agent consults `references/*.md` there but never
+> writes to it, and it lives outside `workspace/` entirely (`skills/<name>/`). It is unaffected
+> by task scoping and out of scope for this doc, but it is the reason the isolation guarantee
+> below counts *four* access points, not three.
+
+**Host audit domain** = an append-only event record *about* the run, not an input to it. Today a
+console transcript is written into the task workspace, which means the agent can `read_file()`
+it and the sandbox can read it via the mount — both context pollution and a leak of host-side
+framing into the agent's view. This is not a theoretical risk: this project's own telemetry shows
+the agent has already `read_file`'d a `runner-*.log` transcript at least once. It moves to
+`workspace/logs/`, a flat sibling of the task dirs,
+with the task id and a unique run id in each filename. That directory is under the same
+`workspace/` base but **not** under any `<task>/` subtree, so it is outside the agent's reach
+(see *Isolation guarantee* below).
+
+> Only audit records leave the task directory. `analyst_log-*.md` and `generated_code/` write
+> under `workspace/<task>/` and stay there.
+
+## Workspace identity and modes
+
+The task name is resolved once at startup:
+
+| Invocation | Task id | Mode |
+|---|---|---|
+| `--task <name>` | `<name>` | accumulate (reusing the name reuses the dir) |
+| `--pristine` | `task-<full-uuid4>` (auto-generated) | pristine (fresh, isolated) |
+| neither | `default` | accumulate, into a stable default dir |
+| `--task` **and** `--pristine` | — | error: mutually exclusive |
+
+- **Pristine is not throwaway.** A pristine run's directory persists after the run (files stay
+  source of truth). It is never selected automatically again, but an operator may deliberately
+  reopen it with `--task <generated-id>`.
+- **Pristine starts with no prior agent state.** A full UUID4 is generated and its directory is
+  created exclusively, retrying on the vanishingly unlikely collision. It contains no prior
+  scripts, reports, generated code, or task-local outputs. It can still read the intentional,
+  read-only evidence in `/data`.
+
+### Task-id rules
+
+Task IDs are identifiers, **not paths**. A user-supplied `--task` must be a single portable slug
+matching `[a-z0-9][a-z0-9_-]{0,63}`. `default`, `data`, and `logs` are reserved. This rejects
+path separators, `.` and `..`, absolute paths, control characters, Unicode-normalization
+collisions, and filename injection into audit paths.
+
+## Isolation guarantee
+
+The agent touches the filesystem through four access points, and none of them can reach
+`workspace/logs/`:
+
+- `FileSystem(root_dir=workspace/<task>)` — FS tools are rooted at the task subdir and cannot
+  traverse above their root.
+- `MountDir("/workspace", workspace/<task>, read-write)` — the sandbox's `pathlib` can reach this
+  writable mount, scoped to the task subdir.
+- `MountDir("/data", workspace/data/, read-only)` — sandboxed code can read canonical evidence,
+  but cannot change it. The FileSystem capability remains rooted at the task workspace and cannot
+  reach `/data`.
+- `MountDir("/skill", skills/<name>/, read-only)` — a read-only mount of the current skill dir,
+  which lives outside `workspace/` entirely, so it can never expose anything under `workspace/`.
+
+The two writable workspace-side access points are scoped to `workspace/<task>/`; `/data` grants
+only read access to the dedicated input directory; and the skill mount is outside `workspace/`
+altogether. Thus anything else under `workspace/`, including `workspace/logs/` and every other
+task directory, is unreachable. Four conditions keep this true:
+
+1. **The root and mount must stay the task subdir.** The entire guarantee is "agent root =
+   `workspace/<task>/`." If either is ever pointed at the `workspace/` base, `logs/` leaks. This
+   is the one invariant a future refactor must not break.
+2. **Task IDs must remain validated identifiers.** Concatenating an unvalidated task string into
+   a path permits traversal such as `foo/../logs`, even if the literal name `logs` is reserved.
+3. **Task roots must be real, direct children of the resolved base.** Reject a pre-existing
+   symlink, non-directory, or a resolved root whose parent is not the workspace base. Validate
+   this once, then reuse that single validated path for everything that touches the task root —
+   the `FileSystem` and `MountDir` constructions, *and* the runner's own direct host-side writes
+   (`analyst_log-*.md`, `generated_code/`). The filesystem tool correctly rejects traversal
+   *below* its root, but cannot make an unsafe root safe — and the host-side `Path.write_text()`
+   calls get no such protection at all, so they depend entirely on this upstream validation.
+4. **`data`, `logs`, and `default` are reserved task names.** They are siblings of task dirs and
+   must never be selected as a task root.
+
+## Directory layout
+
+```
+workspace/                                # base (--workspace, default ./workspace)
+  data/                                   # caller-managed, read-only evidence
+    eve.json
+  default/                                # no flag → accumulate here   ← agent-visible
+    suricata_extract_sni.py               # reusable agent scripts
+    analyst_log-25-07-18_...md            # prior analyses (agent can re-read)
+    generated_code/
+      25-07-18_...-01.py
+  suricata-triage/                        # --task suricata-triage (reused = accumulate)
+  task-9f2a1c7b4e0d-.../                  # --pristine (fresh each time)
+  logs/                                   # reserved; flat; host audit  ← NOT agent-visible
+    runner-default-<run-id>.jsonl         # task name is in the filename
+    runner-suricata-triage-<run-id>.jsonl
+    runner-task-9f2a1c7b4e0d-...-<run-id>.jsonl
+```
+
+`logs/` is flat — one append-only JSON Lines event stream per run, with the task id and unique
+run id in the filename — so an audit record maps one-to-one to its task without nesting. It sits
+beside the task dirs, not inside any of them, which is what keeps it out of the agent's reach.
+
+## Worked examples
+
+`run_stamp` is `YY-MM-DD_HH-MM-SS` for task-local artifact names; each audit file also uses a
+unique `run_id`. Only paths created or changed by each run are shown.
+
+### 1. No flags → `default` task (accumulate)
+
+```
+$ python runner.py "analyze eve.json"
+```
+```
+workspace/
+  data/
+    eve.json                             # host-supplied evidence; agent reads at /data/eve.json
+  default/
+    suricata_extract_sni.py              # agent-saved reusable script
+    analyst_log-25-07-18_14-02-11.md
+    generated_code/
+      25-07-18_14-02-11-01.py
+  logs/
+    runner-default-<run-id>.jsonl        # agent cannot reach this
+```
+
+### 2. Same command later → accumulates in place
+
+```
+$ python runner.py "now check for beacons"
+```
+```
+workspace/
+  default/
+    suricata_extract_sni.py              # ← still here, surfaced to the agent
+    suricata_beacon_score.py             # ← new
+    analyst_log-25-07-18_14-02-11.md     # ← prior analysis, agent can re-read
+    analyst_log-25-07-19_09-15-40.md     # ← new
+    generated_code/
+      25-07-18_14-02-11-01.py
+      25-07-19_09-15-40-01.py            # ← new
+  logs/
+    runner-default-<first-run-id>.jsonl
+    runner-default-<second-run-id>.jsonl # ← new
+```
+
+The agent starts run #2 seeing `suricata_extract_sni.py` and the earlier `analyst_log`.
+
+### 3. `--task suricata-triage` → named, reusable (isolated from `default`)
+
+```
+$ python runner.py --task suricata-triage "triage today's alerts"
+```
+```
+workspace/
+  default/                               # untouched
+  data/                                  # untouched; still mounted at /data read-only
+  suricata-triage/
+    analyst_log-25-07-19_10-30-00.md
+    generated_code/
+      25-07-19_10-30-00-01.py
+  logs/
+    runner-suricata-triage-<run-id>.jsonl
+```
+
+Rerun with `--task suricata-triage` and it accumulates into this same folder.
+
+### 4. `--pristine` → fresh task workspace, no prior agent state
+
+```
+$ python runner.py --pristine "baseline test run"
+```
+```
+workspace/
+  default/                               # untouched
+  data/                                  # untouched; intentional read-only input
+  suricata-triage/                       # untouched
+  task-9f2a1c7b4e0d-.../                 # ← brand new; no prior agent state
+    analyst_log-25-07-19_11-45-22.md
+    generated_code/
+      25-07-19_11-45-22-01.py
+  logs/
+    runner-task-9f2a1c7b4e0d-...-<run-id>.jsonl
+```
+
+Rerunning `--pristine` yields a different UUID directory. Nothing is deleted; the old task is
+not selected automatically, though it can be deliberately reopened with `--task <generated-id>`.
+
+### 5. Custom base
+
+```
+$ python runner.py --task ir-case-42 --workspace /cases/ws "..."
+```
+```
+/cases/ws/
+  data/
+    eve.json
+  ir-case-42/
+    analyst_log-...md
+    generated_code/...
+  logs/
+    runner-ir-case-42-<run-id>.jsonl
+```
+
+### 6. Error / reserved cases
+
+```
+$ python runner.py --task foo --pristine "..."
+error: --task and --pristine are mutually exclusive
+
+$ python runner.py --task logs "..."
+error: 'logs' is a reserved task name
+
+$ python runner.py --task foo/../logs "..."
+error: task names must match [a-z0-9][a-z0-9_-]{0,63}
+```
+
+The invariant across all of these: the agent can write only one `workspace/<task>/` subtree,
+read canonical evidence only through `/data`, and never reach `workspace/logs/` or another task.
+
+## Runner changes
+
+Scoped to `runner.py`, the shared sandbox notes, and skill instructions that describe input
+discovery. No change to Monty's execution model is required.
+
+- **New args:** `--task NAME` (default none), `--pristine` (flag). `--workspace` stays but
+  becomes the workspace base/case root. No input-path flag is added: canonical evidence lives in
+  `<workspace-base>/data/`. No `--results` arg — audit lives under the workspace base.
+- **Task resolution:** compute `task_id` from the table above (error if `--task` and `--pristine`
+  are both set; generate `task-<full-uuid4>` for pristine, creating its directory exclusively).
+  User task names must match the task-id rule; reserve `default`, `data`, and `logs`.
+- **Path derivation:**
+  - `ws_path = <workspace-base>/<task_id>`  (mounted + `FileSystem` root, as today)
+  - `data_dir = <workspace-base>/data`  (mounted at `/data`, read-only)
+  - `logs_dir = <workspace-base>/logs`  (flat; created once)
+- **Validate paths before mounting:** resolve the base once, ensure the selected task root is a
+  real direct child rather than a symlink, and use that validated path for both `FileSystem` and
+  `MountDir`.
+- **Move auditing** out of `ws_path` to an exclusive,
+  `logs_dir/runner-<task_id>-<run-id>.jsonl` file. Append an event as it occurs: run start and
+  configuration, user/continuation prompts, model responses, every tool call and result,
+  `run_code` bodies and returns, errors, and completion. This is deliberately richer than the
+  current console transcript, so failed or interrupted runs retain their audit evidence.
+  `report_path` and `generated_dir` remain under `ws_path`.
+- **Startup message** reports the task id and mode so a run's identity is obvious in the log.
+- **Telemetry:** keep a stable agent name (normally the skill name) and attach `task_id` and
+  `run_id` as run metadata/span attributes. Agent name is a logging identity, not a workspace
+  binding, and task-specific names create unhelpful high-cardinality telemetry.
+- **Input discovery:** update shared sandbox notes and skills: input files are listed by the
+  runner from `data_dir` at startup and read in `run_code` as `/data/<filename>`; all agent
+  outputs continue to use `/workspace`.
+
+### Behavior change to confirm
+
+`--workspace` changes meaning from "the agent workspace directory" to "the workspace
+**base/case root**." Its default layout is now `./workspace/data`, `./workspace/default`, and
+`./workspace/logs`; the agent's writable root is `./workspace/default`. Anyone currently passing
+`--workspace ./foo` will now get `./foo/data`, `./foo/default`, and `./foo/logs`. This is an
+intentional breaking layout change. No automatic migration is planned; legacy contents are left
+untouched and operators place current evidence under `data/`.
+
+## Open items
+
+- **Retention and permissions:** audit records can contain prompts, tool data, generated code,
+  model responses, and reasoning. Set restrictive host permissions and define size/age retention
+  before enabling this on sensitive or long-lived cases. Pristine task directories also persist;
+  cleanup, if wanted, must be a separate explicit action.
+- **Concurrent reuse:** no task-level locking is proposed now. Every run still receives a unique
+  `run_id` and exclusive audit filename so ordinary timestamp collisions cannot merge or
+  overwrite audit records. Concurrent writes to the same accumulated task remain unsupported.
+
+---
+
+## Appendix: why not Monty snapshotting
+
+The original draft of this file proposed serializing Monty's interpreter state
+(`MontyRepl.dump()` / `FunctionSnapshot` / etc.) to carry work across runs. It was set aside:
+
+- The goal is workspace **lifecycle**, which is a directory concern, not an interpreter-state
+  concern. Task-scoped directories solve it completely.
+- Files are the source of truth, so any snapshot would only ever be a cache — never the
+  persistence mechanism.
+- A stateful `MontyRepl` would *fight* the pristine goal: "pollution" would then include
+  invisible heap state, not just files, making "start clean" harder to guarantee, and it would
+  require abandoning the stateless-snippet execution model that the runner and every `SKILL.md`
+  assume.
+
+The only piece worth revisiting later is `Monty.dump()`/`Monty.load()` as a **parse cache**
+(avoid re-parsing skill/reference code on cold start). That is a transparent optimization with no
+execution-model or pollution impact. If added, its one caveat: a loaded cache blob is
+deserialized state read back into the host process, so only cache blobs the runner itself wrote
+should be loaded; any externally supplied blob must be treated as untrusted. (Note: the earlier
+draft's API table conflated `Monty.dump/load` — a parse cache — with `MontyRepl.dump/load` — a
+REPL-session cache; they are distinct mechanisms.)
