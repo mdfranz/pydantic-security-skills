@@ -7,6 +7,13 @@ A Pydantic AI-based execution environment for running security analyst skills sa
 Currently ships one skill: **`suricata-analyst`** — analyzes Suricata EVE JSON logs (network
 threats, suspicious egress, protocol anomalies).
 
+## Further reading
+
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — components, structure, and trust boundaries.
+- [`PYDANTIC-STACK.md`](PYDANTIC-STACK.md) — how the pydantic-ai/harness/Monty stack is wired
+  together, and why.
+- [`PROJECT.md`](PROJECT.md) — development history and design decisions by phase.
+
 ## How it works
 
 - `runner.py` loads a skill's `SKILL.md` as the agent's instructions.
