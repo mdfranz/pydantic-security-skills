@@ -7,6 +7,11 @@ A Pydantic AI-based execution environment for running security analyst skills sa
 Currently ships one skill: **`suricata-analyst`** — analyzes Suricata EVE JSON logs (network
 threats, suspicious egress, protocol anomalies).
 
+## Related projects
+
+- [sec-skillz](https://github.com/mdfranz/sec-skillz)
+- [agno-catbox](https://github.com/mdfranz/agno-catbox)
+
 ## Further reading
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — components, structure, and trust boundaries.
