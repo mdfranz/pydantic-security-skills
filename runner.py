@@ -9,7 +9,9 @@ from pathlib import Path
 
 import yaml
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart
+from pydantic_ai.capabilities import Thinking
+from pydantic_ai.messages import ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart, ThinkingPart
+from pydantic_ai.profiles.anthropic import ANTHROPIC_THINKING_BUDGET_MAP
 from pydantic_ai_harness import CodeMode, FileSystem
 from pydantic_monty import MountDir, OSAccess
 
@@ -137,12 +139,25 @@ def format_conversation_history(result, prompt: str) -> str:
                         if len(str(content)) > 1000:
                             content = str(content)[:1000] + "\n... (truncated)"
                         lines.append(f"```\n{content}\n```\n")
+                elif isinstance(part, ThinkingPart):
+                    if part.content.strip():
+                        lines.append(f"**Agent (Thinking):**\n> {part.content.strip().replace('\n', '\n> ')}\n\n")
                 else:
                     # Text content from model
                     if hasattr(part, 'content') and str(part.content).strip():
                         lines.append(f"**Agent:** {part.content}\n\n")
 
     return "".join(lines)
+
+
+def print_thinking(result) -> None:
+    """Print any thinking/reasoning parts generated in the latest run step."""
+    for msg in result.new_messages():
+        if isinstance(msg, ModelResponse):
+            for part in msg.parts:
+                if isinstance(part, ThinkingPart) and part.content.strip():
+                    print("\n--- Agent Thinking ---")
+                    print(part.content.strip())
 
 def main():
     parser = argparse.ArgumentParser(description="Pydantic AI Security Skill Runner")
@@ -163,6 +178,18 @@ def main():
         "--interactive",
         action="store_true",
         help="Interactive mode: agent explains its investigation plan and asks for confirmation before deep analysis.",
+    )
+    parser.add_argument(
+        "--thinking",
+        default=None,
+        choices=["low", "medium", "high", "xhigh"],
+        help="Enable model thinking/reasoning with the specified effort level.",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="The maximum number of tokens to generate before stopping.",
     )
     args = parser.parse_args()
 
@@ -214,24 +241,42 @@ def main():
             "Multiple short checkpoints are better than one long silent analysis."
         )
 
+    capabilities = [
+        FileSystem(root_dir=str(ws_path)),
+        CodeMode(
+            tools=[],  # Keep FileSystem tools native so they're callable without run_code
+            mount=[
+                MountDir(SANDBOX_WORKSPACE_MOUNT, str(ws_path), mode="read-write"),
+                # Read-only so generated code can consult a skill's reference material
+                # (e.g. references/*.md) without being able to modify the skill itself.
+                MountDir(SANDBOX_SKILL_MOUNT, str(skill_path.resolve()), mode="read-only"),
+            ],
+            # Empty environ keeps host env vars isolated; only the host clock is exposed,
+            # so generated code can timestamp filenames per the skill's naming convention.
+            os_access=OSAccess(environ={}),
+        ),
+    ]
+
+    model_settings = {}
+    if args.max_tokens is not None:
+        model_settings["max_tokens"] = args.max_tokens
+
+    if args.thinking:
+        capabilities.append(Thinking(effort=args.thinking))
+        # Anthropic rejects requests where max_tokens <= thinking.budget_tokens. Floor
+        # max_tokens to comfortably clear the budget even if the user passed an explicit
+        # --max-tokens that's too low for this effort level -- an explicit but insufficient
+        # value should still be raised, not trusted as-is.
+        effort_budget = ANTHROPIC_THINKING_BUDGET_MAP[args.thinking]
+        min_max_tokens = effort_budget + 4096
+        if model_settings.get("max_tokens", 0) < min_max_tokens:
+            model_settings["max_tokens"] = min_max_tokens
+
     agent = Agent(
         args.model,
         system_prompt=instructions,
-        capabilities=[
-            FileSystem(root_dir=str(ws_path)),
-            CodeMode(
-                tools=[],  # Keep FileSystem tools native so they're callable without run_code
-                mount=[
-                    MountDir(SANDBOX_WORKSPACE_MOUNT, str(ws_path), mode="read-write"),
-                    # Read-only so generated code can consult a skill's reference material
-                    # (e.g. references/*.md) without being able to modify the skill itself.
-                    MountDir(SANDBOX_SKILL_MOUNT, str(skill_path.resolve()), mode="read-only"),
-                ],
-                # Empty environ keeps host env vars isolated; only the host clock is exposed,
-                # so generated code can timestamp filenames per the skill's naming convention.
-                os_access=OSAccess(environ={}),
-            ),
-        ],
+        capabilities=capabilities,
+        model_settings=model_settings or None,
     )
 
     lint_and_fix_scripts(ws_path)
@@ -250,6 +295,7 @@ def main():
     try:
         print(f"Running Pydantic AI agent on skill: {skill_path.name}")
         result = agent.run_sync(run_prompt)
+        print_thinking(result)
         print("\n--- Agent Response ---")
         print(result.output)
 
@@ -275,6 +321,7 @@ def main():
                         "After completing this phase, summarize what you found and ask if they want to continue further."
                     )
                     result = agent.run_sync(continuation_prompt, message_history=result.all_messages())
+                    print_thinking(result)
                     print("\n--- Analysis Continued ---")
                     print(result.output)
                     all_outputs.append(result.output)
@@ -290,6 +337,7 @@ def main():
                             "ask if they want to continue investigating other angles."
                         )
                         result = agent.run_sync(continuation_prompt, message_history=result.all_messages())
+                        print_thinking(result)
                         print("\n--- Focused Analysis ---")
                         print(result.output)
                         all_outputs.append(result.output)

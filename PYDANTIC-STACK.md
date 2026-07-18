@@ -9,7 +9,7 @@ which covers usage; this covers *why the code is built the way it is*.
 
 | Package | Version (`uv.lock`) | Role here |
 | --- | --- | --- |
-| [`pydantic-ai`](https://ai.pydantic.dev) | 2.9.1 | The `Agent` — model calling, tool-calling loop, message history |
+| [`pydantic-ai`](https://ai.pydantic.dev) | 2.11.0 | The `Agent` — model calling, tool-calling loop, message history |
 | [`pydantic-ai-harness`](https://github.com/pydantic/pydantic-ai-harness) | 0.7.0 | `FileSystem` and `CodeMode` capabilities plugged into the `Agent` |
 | [`pydantic-monty`](https://github.com/pydantic/monty) | 0.0.18 | `Monty` — the sandboxed Python interpreter that actually executes model-written code, plus `MountDir`/`OSAccess` |
 | [`logfire`](https://pydantic.dev/logfire) | 4.37.0 | Optional OpenTelemetry tracing of the whole run (`--logfire`) |
@@ -24,9 +24,10 @@ None of these are used in isolation — the interesting part is how `Agent`, `Co
 
 ```python
 agent = Agent(
-    args.model,                 # e.g. "google:gemini-3-flash-preview"
-    system_prompt=instructions, # SKILL.md's full contents
+    args.model,                       # e.g. "google:gemini-3-flash-preview"
+    system_prompt=instructions,       # SKILL.md's full contents
     capabilities=[...],
+    model_settings=model_settings or None,
 )
 ```
 
@@ -36,16 +37,57 @@ agent = Agent(
 - the **system prompt**, which is literally the skill's `SKILL.md` file read verbatim
   (`load_skill()`, `runner.py:35-47`) — the skill *is* the prompt, there's no templating layer,
 - the **tool-calling loop** — `agent.run_sync(run_prompt)` (`runner.py:121`) drives however many
-  model⇄tool round trips are needed until the model produces a final answer.
+  model⇄tool round trips are needed until the model produces a final answer,
+- **`model_settings`**, a generic passthrough for provider-level request parameters (`max_tokens`,
+  `temperature`, etc.), applied to every call for the life of the agent. This project only ever
+  populates one key in it, `max_tokens`, and only when `--max-tokens` and/or `--thinking` is
+  passed (`runner.py:260-273`, see §2).
 
 `capabilities` is pydantic-ai's extension point for bolting cross-cutting behavior onto an
-agent (tool wrapping, filesystem access, deferred-tool handling, etc.) without touching the
-tool-calling loop itself. This project uses two, both from `pydantic-ai-harness`, layered in a
-specific order that matters (see §4).
+agent (tool wrapping, filesystem access, deferred-tool handling, reasoning effort, etc.) without
+touching the tool-calling loop itself. This project uses three: two from `pydantic-ai-harness`
+(§3, §4), layered in a specific order that matters (see §5), and one from core `pydantic-ai`
+itself, `Thinking`, which is conditional rather than always-on (§2).
 
 ---
 
-## 2. `pydantic-ai-harness`: `FileSystem`
+## 2. `pydantic-ai`: the `Thinking` capability
+
+```python
+if args.thinking:
+    capabilities.append(Thinking(effort=args.thinking))
+    # Anthropic rejects requests where max_tokens <= thinking.budget_tokens. Floor
+    # max_tokens to comfortably clear the budget even if the user passed an explicit
+    # --max-tokens that's too low for this effort level.
+    effort_budget = ANTHROPIC_THINKING_BUDGET_MAP[args.thinking]
+    min_max_tokens = effort_budget + 4096
+    if model_settings.get("max_tokens", 0) < min_max_tokens:
+        model_settings["max_tokens"] = min_max_tokens
+```
+
+`Thinking` (imported from `pydantic_ai.capabilities` — core `pydantic-ai`, not the harness) is
+appended to the capabilities list only when `--thinking <effort>` is passed on the CLI. It
+requests extended reasoning from whichever model is in use at one of four effort levels
+(`low`/`medium`/`high`/`xhigh`), giving a single unified knob across providers that expose
+reasoning differently under the hood (Anthropic's `budget_tokens`, OpenAI's `reasoning.effort`,
+etc.) — the same `--thinking high` flag works unchanged against `anthropic`, `openai`, and
+`google` models.
+
+Anthropic's API specifically rejects any request where `max_tokens` isn't strictly greater than
+`thinking.budget_tokens` — the model can't be given fewer output tokens than it's allowed to
+spend on reasoning alone. `ANTHROPIC_THINKING_BUDGET_MAP` (imported from
+`pydantic_ai.profiles.anthropic`) is the same lookup table pydantic-ai's own Anthropic model
+class uses internally to translate an `effort` level into `budget_tokens`; `runner.py` reuses it
+directly (rather than hand-maintaining a duplicate) so the two can't drift apart, and computes a
+floor of `budget_tokens + 4096` for `model_settings["max_tokens"]`. An explicit `--max-tokens`
+value is only left alone if it already clears that floor — an insufficient explicit value gets
+raised, not trusted as-is, which is what closed a real `max_tokens must be greater than
+thinking.budget_tokens` 400 error hit in testing. The constraint itself is Anthropic-specific, so
+the floor is simply unused (harmless) against providers that don't enforce it.
+
+---
+
+## 3. `pydantic-ai-harness`: `FileSystem`
 
 ```python
 FileSystem(root_dir=str(ws_path))
@@ -66,7 +108,7 @@ under two different views; `/skill` only exists from inside `run_code`.
 
 ---
 
-## 3. `pydantic-ai-harness`: `CodeMode`
+## 4. `pydantic-ai-harness`: `CodeMode`
 
 ```python
 CodeMode(
@@ -173,13 +215,15 @@ tools are added later.
 
 ---
 
-## 4. Capability ordering
+## 5. Capability ordering
 
 ```python
-capabilities=[
+capabilities = [
     FileSystem(root_dir=str(ws_path)),
     CodeMode(tools=[], ...),
 ]
+if args.thinking:
+    capabilities.append(Thinking(effort=args.thinking))
 ```
 
 `FileSystem` is listed first so its tools exist on the agent before `CodeMode` decides how to
@@ -187,11 +231,16 @@ present them. `CodeMode` declares itself `position='outermost'` internally (it w
 whole assembled toolset, including `ToolSearch` if present) — but *which* of those tools get
 folded into `run_code` is entirely controlled by `CodeMode.tools`, independent of list order.
 With `tools=[]`, order doesn't currently change behavior, but it's the natural place to add a
-selector predicate later if a future skill adds tools that *should* be sandboxed (see §7).
+selector predicate later if a future skill adds tools that *should* be sandboxed (see §8).
+
+`Thinking` is appended last, and conditionally — it doesn't wrap or select tools the way
+`FileSystem`/`CodeMode` do, so its position relative to them doesn't matter; it's ordered last
+here simply because whether it's added at all depends on a CLI flag evaluated after the other
+two are already in the list.
 
 ---
 
-## 5. `pydantic-monty`: the actual sandbox
+## 6. `pydantic-monty`: the actual sandbox
 
 `Monty` is the interpreter `CodeMode` hands generated code to. It is **not** a subprocess or a
 container — it's a from-scratch Python-subset interpreter with its own type checker, so:
@@ -216,7 +265,7 @@ container — it's a from-scratch Python-subset interpreter with its own type ch
 
 ---
 
-## 6. Data flow, end to end
+## 7. Data flow, end to end
 
 ```
 SKILL.md ──(read verbatim)──► Agent(system_prompt=...)
@@ -254,7 +303,7 @@ equivalent at all — reference material is only reachable via `run_code`.
 
 ---
 
-## 7. Observability: Logfire
+## 8. Observability: Logfire
 
 ```python
 if args.logfire:
@@ -278,7 +327,7 @@ the two lines above.
 
 ---
 
-## 8. Design rationale, summarized
+## 9. Design rationale, summarized
 
 | Decision | Why |
 | --- | --- |
@@ -286,6 +335,7 @@ the two lines above.
 | `mount` = `[workspace rw, skill read-only]` | Sandboxed code gets real file I/O for the (potentially 250MB+) log data, plus read access to a skill's own reference material — without ever seeing the rest of the host filesystem, and without letting generated code modify the skill's source |
 | `os_access=OSAccess(environ={})` | Sandboxed code gets a working clock for filename timestamps, but zero visibility into host secrets/env vars |
 | `dynamic_catalog` left at default (`False`) | No `ToolSearch`/dynamic tool discovery in play yet — the cache-stability tradeoff it solves doesn't apply |
+| `Thinking` capability only added when `--thinking` is passed, with `model_settings["max_tokens"]` floored via pydantic-ai's own `ANTHROPIC_THINKING_BUDGET_MAP` | Reasoning effort should be opt-in, not always paid for; the floor prevents Anthropic's `max_tokens must be greater than thinking.budget_tokens` 400 without hand-duplicating pydantic-ai's own budget table |
 | Monty's stdlib subset + no-class restriction | Guarantees any skill's instructions (however phrased) can never pull in `pandas`/`duckdb`/etc. or execute anything outside the interpreter's control |
 | Every `run_code` call persisted to `generated_code/` | Audit trail independent of what the model chooses to save via `write_file` |
 | Full transcript (`runner-*.log`) + final answer (`analyst_log-*.md`) written separately | The report is consumable without parsing console output; the transcript is there for post-hoc debugging (including feeding into Logfire trace lookups by timestamp) |

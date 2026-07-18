@@ -45,6 +45,8 @@ Flags:
 - `--workspace` — directory the agent's `FileSystem` capability is scoped to (default `./workspace`).
 - `--debug` — prints the Python code the model generated and ran inside the Monty sandbox for each `run_code` call, plus its return value.
 - `--logfire` — traces the run with [Logfire](https://pydantic.dev/logfire). Prints a live span tree to the console with zero setup; also ships to the Logfire UI once authenticated (see below).
+- `--thinking` — enables model thinking/reasoning with a specified effort level (`low`, `medium`, `high`, `xhigh`). Useful for complex reasoning tasks on supporting models (e.g. Gemini 3+ / Claude Opus 4.6+).
+- `--max-tokens` — the maximum number of tokens to generate before stopping. Defaults to automatically scaling when thinking effort is set, preventing Anthropic API validation errors.
 
 Every run also retains artifacts in the workspace: `runner-YY-MM-DD_HH-MM-SS.log` contains the
 full transcript, `generated_code/` contains each generated `run_code` program, and

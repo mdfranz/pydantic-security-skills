@@ -69,6 +69,11 @@ A few other stdlib/builtin gaps that are easy to reach for out of habit and will
   a fallback hook.
 - f-string format specs don't support the comma thousands-separator (`f"{n:,}"` raises a
   `SyntaxError`) — build the separators manually if needed, or just print the raw number.
+- A `run_code` return value with a `dict` keyed by a non-string (e.g. a port number pulled
+  straight from a log field, `results[dest_port] = ...`) fails tool-result validation with a
+  `pydantic_core.ValidationError` like `Input should be a valid string [type=string_type,
+  input_value=3478, input_type=int]`. Always `str()` the key when building a dict you intend to
+  return or print as JSON: `results[str(dest_port)] = ...`.
 
 ## Running a Saved Script
 
