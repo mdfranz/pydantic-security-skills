@@ -1,7 +1,9 @@
 import argparse
 import json
 import logging
+import re
 import sys
+import textwrap
 from datetime import datetime
 from pathlib import Path
 
@@ -13,6 +15,41 @@ from pydantic_monty import MountDir, OSAccess
 
 SANDBOX_WORKSPACE_MOUNT = "/workspace"
 SANDBOX_SKILL_MOUNT = "/skill"
+
+# Saved scripts are never executed as `python script.py` -- they're reused by pasting their
+# text into a run_code call, where they always run as a top-level snippet. __name__ is never
+# defined in that sandbox, so a trailing `if __name__ == "__main__":` guard (idiomatic in host
+# Python, but a NameError landmine here) keeps showing up despite skill instructions warning
+# against it. Lint and auto-fix it deterministically instead of relying on the model to comply.
+MAIN_GUARD_RE = re.compile(r'^if __name__ == [\'"]__main__[\'"]\s*:[ \t]*(?:#.*)?\n', re.MULTILINE)
+SYS_ARGV_RE = re.compile(r'\bsys\.argv\b')
+
+
+def lint_and_fix_scripts(ws_path: Path) -> None:
+    """Strip unsupported `if __name__ == \"__main__\":` guards from saved workspace scripts,
+    and warn about `sys.argv` usage (not auto-fixed -- the right replacement is contextual)."""
+    for script_path in sorted(ws_path.glob("*.py")):
+        text = script_path.read_text(encoding="utf-8")
+
+        match = MAIN_GUARD_RE.search(text)
+        if match:
+            body = textwrap.dedent(text[match.end():])
+            text = text[: match.start()] + body
+            script_path.write_text(text, encoding="utf-8")
+            print(
+                f"Auto-fixed {script_path.name}: removed unsupported "
+                f'`if __name__ == "__main__":` guard (Monty has no __name__).'
+            )
+
+        # Naive comment stripping (good enough for this heuristic, ignores '#' in string
+        # literals) so mentioning sys.argv in a comment doesn't trigger a false warning.
+        code_only = "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+        if SYS_ARGV_RE.search(code_only):
+            print(
+                f"Warning: {script_path.name} uses sys.argv, which is not settable in the "
+                "Monty sandbox and will fail when reused. Fix manually -- replace with a plain "
+                "variable assigned near the top of the file."
+            )
 
 
 class TeeWriter:
@@ -33,6 +70,18 @@ class TeeWriter:
 
     def isatty(self):
         return self.console.isatty()
+
+SANDBOX_NOTES_PATH = Path(__file__).parent / "prompts" / "sandbox_notes.md"
+
+
+def load_sandbox_notes() -> str:
+    """Runtime/workspace mechanics shared by every skill (Monty sandbox constraints, the
+    script-reuse pattern, artifact conventions) -- prepended to each skill's own instructions
+    so it only needs to be maintained in one place instead of duplicated per skill."""
+    if SANDBOX_NOTES_PATH.exists():
+        return SANDBOX_NOTES_PATH.read_text(encoding="utf-8")
+    return ""
+
 
 def load_skill(skill_dir: Path):
     yaml_path = skill_dir / "skill.yaml"
@@ -147,7 +196,9 @@ def main():
 
     skill_path = Path(args.skill_dir)
     config = load_skill(skill_path)
-    instructions = config.get("instructions", "You are a security analyst.")
+    skill_instructions = config.get("instructions", "You are a security analyst.")
+    sandbox_notes = load_sandbox_notes()
+    instructions = f"{sandbox_notes}\n\n{skill_instructions}" if sandbox_notes else skill_instructions
 
     # In interactive mode, add checkpoint instructions after major analysis phases
     if args.interactive:
@@ -182,6 +233,8 @@ def main():
             ),
         ],
     )
+
+    lint_and_fix_scripts(ws_path)
 
     existing_scripts = sorted(p.name for p in ws_path.glob("*.py"))
     run_prompt = args.prompt
@@ -221,7 +274,7 @@ def main():
                         "The user wants to continue. Proceed with the next phase of analysis you outlined. "
                         "After completing this phase, summarize what you found and ask if they want to continue further."
                     )
-                    result = agent.run_sync(continuation_prompt)
+                    result = agent.run_sync(continuation_prompt, message_history=result.all_messages())
                     print("\n--- Analysis Continued ---")
                     print(result.output)
                     all_outputs.append(result.output)
@@ -236,7 +289,7 @@ def main():
                             "Adjust your analysis to focus on this area specifically. After this analysis phase, "
                             "ask if they want to continue investigating other angles."
                         )
-                        result = agent.run_sync(continuation_prompt)
+                        result = agent.run_sync(continuation_prompt, message_history=result.all_messages())
                         print("\n--- Focused Analysis ---")
                         print(result.output)
                         all_outputs.append(result.output)
@@ -290,6 +343,10 @@ def main():
                     print(f"\n[return {part.tool_call_id}]\n{part.content}")
         if code_index:
             print(f"Saved {code_index} generated run_code artifact(s) in {generated_dir}")
+
+        # Fix up any scripts saved this run before the process exits, so a same-run reuse
+        # later in this session (or the next session's inventory) never sees a broken guard.
+        lint_and_fix_scripts(ws_path)
 
     finally:
         transcript_file.flush()
