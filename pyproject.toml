@@ -8,3 +8,8 @@ dependencies = [
     "pydantic-ai-harness[codemode]>=0.7.0",
     "pyyaml>=6.0.3",
 ]
+
+[project.optional-dependencies]
+tui = [
+    "textual>=8.2.8",
+]

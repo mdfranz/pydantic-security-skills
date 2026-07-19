@@ -1,12 +1,16 @@
-"""Thin CLI entrypoint: argparse, UI dispatch, and SIGTERM exit-code mapping. No agent
-execution, workspace mutation, artifact formatting, or UI rendering lives here -- see
-run_core.py (shared run behavior) and console_ui.py / ui_textual.py (the two UI drivers)."""
+"""Thin CLI entrypoint: argparse, positional resolution, UI selection/dispatch, and
+SIGTERM exit-code mapping. No agent execution, workspace mutation, artifact formatting, or
+UI rendering lives here -- see run_core.py (shared run behavior) and console_ui.py /
+ui_textual.py (the two UI drivers)."""
 
 import argparse
+import importlib.util
 
 from audit import RunInterrupted, map_run_interrupted_exit_code
 from console_ui import run_console
 from run_core import TASK_ID_RE, TaskError, load_models_config
+
+DEFAULT_SKILL_DIR = "skills/suricata-analyst"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -15,9 +19,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(description="Pydantic AI Security Skill Runner")
     parser.add_argument(
-        "skill_dir", nargs="?", default="skills/suricata-analyst", help="Path to skill directory"
+        "positionals",
+        nargs="*",
+        metavar="[skill_dir] prompt",
+        help="Path to skill directory (optional, defaults to "
+        f"{DEFAULT_SKILL_DIR}) and the query prompt. The prompt itself is optional only "
+        "with --ui textual (an empty session opens and the first message is typed into "
+        "the bottom bar); console mode always requires one.",
     )
-    parser.add_argument("prompt", help="Query prompt for the agent")
+    parser.add_argument(
+        "--ui",
+        default="console",
+        choices=["console", "textual"],
+        help="UI mode. 'console' (default): today's raw-print behavior, scripts/one-shot "
+        "runs. 'textual': multi-panel TUI for interactive investigation sessions -- "
+        "requires the 'textual' extra (uv sync --extra tui).",
+    )
     parser.add_argument("--model", default=default_model, help="Model ID or alias")
     parser.add_argument(
         "--workspace",
@@ -50,7 +67,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--interactive",
         action="store_true",
-        help="Interactive mode: agent explains its investigation plan and asks for confirmation before deep analysis.",
+        help="Interactive mode: agent explains its investigation plan and asks for confirmation "
+        "before deep analysis. Under --ui textual this only affects that system-prompt "
+        "addendum -- the bottom bar always accepts free-text follow-ups either way.",
     )
     parser.add_argument(
         "--thinking",
@@ -67,12 +86,40 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_positionals(
+    positionals: list[str], ui: str, parser: argparse.ArgumentParser
+) -> tuple[str, str | None]:
+    """Resolve the shared [skill_dir] prompt positional grammar. A single optional
+    positional would be ambiguous with argparse (it can't tell a lone skill_dir from a lone
+    prompt), so both stay one positional list, resolved explicitly here instead."""
+    if len(positionals) == 0:
+        if ui != "textual":
+            parser.error("prompt is required unless --ui textual is used with no arguments")
+        return DEFAULT_SKILL_DIR, None
+    if len(positionals) == 1:
+        return DEFAULT_SKILL_DIR, positionals[0]
+    if len(positionals) == 2:
+        return positionals[0], positionals[1]
+    parser.error("too many positional arguments (expected: [skill_dir] prompt)")
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
 
+    skill_dir, initial_prompt = resolve_positionals(args.positionals, args.ui, parser)
+
+    # Before any workspace/task directory is created, since --pristine has side effects.
+    if args.ui == "textual" and importlib.util.find_spec("textual") is None:
+        parser.error("--ui textual requires the 'textual' extra: uv sync --extra tui")
+
     try:
-        run_console(args.skill_dir, args.prompt, args)
+        if args.ui == "textual":
+            from ui_textual import run_textual
+
+            run_textual(skill_dir, initial_prompt, args)
+        else:
+            run_console(skill_dir, initial_prompt, args)
     except TaskError as e:
         parser.error(str(e))
 
