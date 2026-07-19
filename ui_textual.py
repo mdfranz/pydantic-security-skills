@@ -6,17 +6,35 @@ a console-only install never imports textual."""
 
 import argparse
 import asyncio
-import json
 import signal
+from datetime import datetime
 
-from textual import work
+from rich.text import Text
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import DataTable, DirectoryTree, Footer, Header, Input, RichLog
+from textual.screen import ModalScreen
+from textual.widgets import Button, DataTable, DirectoryTree, Footer, Header, Input, Label, RichLog
 
 from audit import RunInterrupted, make_event_stream_handler
 from run_core import ArtifactSession, RunSetup, prepare_run, run_turn_async, write_artifacts
 from script_lint import lint_and_fix_scripts
+
+_CELL_TEXT_LIMIT = 300
+
+
+def _cell_text(value: object, limit: int = _CELL_TEXT_LIMIT) -> Text:
+    """Plain (non-markup) Rich Text for DataTable cells. Tool output routinely contains
+    literal '[...]' -- e.g. read_file's '[path | N lines | hash:...]' header -- which
+    DataTable's default markup parsing (triggered for any plain str cell) would swallow as
+    an unrecognized style tag, rendering the cell blank instead of raising. Wrapping in Text
+    up front skips that parsing entirely. Also truncates with a visible ellipsis, since
+    update_cell doesn't grow the column to fit new content (update_width defaults to False)
+    -- without this, long results were silently hard-clipped with no sign anything was cut."""
+    text = str(value)
+    if len(text) > limit:
+        text = text[:limit] + "…"
+    return Text(text)
 
 
 class BufferedTextualSink:
@@ -53,10 +71,19 @@ class TextualSink:
         elif kind == "model_thinking":
             self.app.output_log.write(f"[dim]Agent (thinking): {fields['content']}[/dim]")
         elif kind == "run_code_call":
-            table.add_row("run_code", str(fields["code"]), "(pending)", key=str(fields["tool_call_id"]))
+            table.add_row(
+                _cell_text(datetime.now().strftime("%H:%M:%S")),
+                _cell_text("run_code"),
+                _cell_text("(pending)"),
+                key=str(fields["tool_call_id"]),
+            )
         elif kind == "tool_call":
-            args = json.dumps(fields.get("args") or {})
-            table.add_row(str(fields["tool_name"]), args, "(pending)", key=str(fields["tool_call_id"]))
+            table.add_row(
+                _cell_text(datetime.now().strftime("%H:%M:%S")),
+                _cell_text(fields["tool_name"]),
+                _cell_text("(pending)"),
+                key=str(fields["tool_call_id"]),
+            )
         elif kind == "run_code_return":
             self._update_result(fields["tool_call_id"], fields["content"])
         elif kind == "tool_result":
@@ -69,11 +96,96 @@ class TextualSink:
     def _update_result(self, tool_call_id: object, content: object) -> None:
         table = self.app.tool_table
         try:
-            table.update_cell(str(tool_call_id), self.app.tool_result_column, str(content))
+            table.update_cell(str(tool_call_id), self.app.tool_result_column, _cell_text(content))
         except Exception:
             # No matching call row (shouldn't happen given the event stream's call/result
             # ordering) -- never let a rendering hiccup crash the run.
-            table.add_row("?", "", str(content), key=str(tool_call_id))
+            table.add_row(
+                _cell_text(datetime.now().strftime("%H:%M:%S")),
+                _cell_text("?"),
+                _cell_text(content),
+                key=str(tool_call_id),
+            )
+
+
+class ToolTable(DataTable):
+    """DataTable with fixed-width Time/Tool columns and a Result column that fills whatever
+    horizontal space is left. DataTable has no built-in flex/stretch column, so this
+    recomputes explicit column widths on every resize -- including the initial layout pass,
+    since a widget's size is still Size(0, 0) inside on_mount() (confirmed via a headless
+    Pilot test), before Textual has actually arranged it."""
+
+    TIME_COLUMN_WIDTH = 8  # "HH:MM:SS"
+    # Covers every tool name this harness actually exposes except the rarely-called
+    # "create_directory" (16 chars, clipped by 2) -- narrower than the worst case on purpose,
+    # since every fixed cell spent here is one taken from Result.
+    TOOL_COLUMN_WIDTH = 14
+
+    def on_mount(self) -> None:
+        self._time_column, self._tool_column, self.result_column = self.add_columns(
+            "Time", "Tool", "Result"
+        )
+        self._resize_columns()
+
+    def on_resize(self, event: events.Resize) -> None:
+        self._resize_columns()
+
+    def _resize_columns(self) -> None:
+        if not self.columns:
+            return
+        # Render width per column includes left+right padding -- account for all three.
+        total_padding = 2 * self.cell_padding * len(self.columns)
+        fixed = self.TIME_COLUMN_WIDTH + self.TOOL_COLUMN_WIDTH
+        available = self.size.width - fixed - total_padding
+        self.columns[self._time_column].width = self.TIME_COLUMN_WIDTH
+        self.columns[self._tool_column].width = self.TOOL_COLUMN_WIDTH
+        # Falls back to a small positive width before the first real resize event lands
+        # (size is still 0 at that point) -- harmless, immediately corrected once Textual
+        # arranges the widget and fires Resize.
+        self.columns[self.result_column].width = max(available, 10)
+        self._require_update_dimensions = True
+        self.refresh(layout=True)
+
+
+class QuitConfirmScreen(ModalScreen[bool]):
+    """Ctrl+Q's own default binding exits immediately -- fine for a one-shot console run,
+    but here it can throw away an in-progress multi-turn investigation session, so quitting
+    always asks first."""
+
+    CSS = """
+    QuitConfirmScreen {
+        align: center middle;
+    }
+    #quit-dialog {
+        width: auto;
+        height: auto;
+        padding: 1 2;
+        border: thick $accent;
+        background: $panel;
+    }
+    #quit-message {
+        padding-bottom: 1;
+    }
+    #quit-buttons {
+        width: auto;
+        height: auto;
+    }
+    """
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="quit-dialog"):
+            yield Label("Quit the analyst session?", id="quit-message")
+            with Horizontal(id="quit-buttons"):
+                yield Button("Quit", variant="error", id="confirm-quit")
+                yield Button("Cancel", variant="primary", id="cancel-quit")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "confirm-quit")
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
 
 
 class AnalystApp(App):
@@ -81,24 +193,28 @@ class AnalystApp(App):
     prompting/follow-ups, for interactive investigation sessions."""
 
     CSS = """
-    #left-col {
+    #output {
+        width: 55%;
+    }
+    #side-col {
         width: 45%;
     }
     #tool-calls {
         height: 60%;
     }
+    #tool-calls > .datatable--header {
+        background: $panel-lighten-1;
+        color: $text;
+    }
     #artifacts {
         height: 40%;
         border-top: solid $accent;
-    }
-    #output {
-        width: 55%;
     }
     """
 
     def __init__(self, setup: RunSetup, buffered_messages: list[str]):
         super().__init__()
-        self.title = f"{setup.skill_name} -- {setup.task_id}"
+        self.title = f"{setup.skill_name} -- {setup.task_id} -- {setup.model}"
         self.setup = setup
         self.buffered_messages = buffered_messages
         self.sink = TextualSink(self)
@@ -114,12 +230,12 @@ class AnalystApp(App):
         self._first_turn_sent = False
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        yield Header(show_clock=False)
         with Horizontal():
-            with Vertical(id="left-col"):
-                yield DataTable(id="tool-calls")
-                yield DirectoryTree(str(self.setup.ws_path), id="artifacts")
             yield RichLog(id="output", markup=True, wrap=True)
+            with Vertical(id="side-col"):
+                yield ToolTable(id="tool-calls")
+                yield DirectoryTree(str(self.setup.ws_path), id="artifacts")
         yield Input(placeholder="Ask the analyst...", id="prompt-bar")
         yield Footer()
 
@@ -135,8 +251,8 @@ class AnalystApp(App):
         asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, self._handle_sigterm)
 
         self.output_log = self.query_one("#output", RichLog)
-        self.tool_table = self.query_one("#tool-calls", DataTable)
-        _, _, self.tool_result_column = self.tool_table.add_columns("Tool", "Call", "Result")
+        self.tool_table = self.query_one("#tool-calls", ToolTable)
+        self.tool_result_column = self.tool_table.result_column
         self.artifacts_tree = self.query_one("#artifacts", DirectoryTree)
         self.prompt_bar = self.query_one("#prompt-bar", Input)
         self.prompt_bar.focus()
@@ -160,6 +276,13 @@ class AnalystApp(App):
 
     def request_artifacts_reload(self) -> None:
         self.artifacts_tree.reload()
+
+    @work
+    async def action_quit(self) -> None:
+        # Overrides App's default action_quit (bound to Ctrl+Q), which exits immediately --
+        # push_screen_wait requires an active worker context, hence @work here.
+        if await self.push_screen_wait(QuitConfirmScreen()):
+            self.exit()
 
     def _handle_sigterm(self) -> None:
         reason = "received signal SIGTERM"

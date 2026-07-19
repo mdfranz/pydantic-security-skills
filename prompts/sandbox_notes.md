@@ -69,15 +69,22 @@ top-level script, never as an imported module. This means:
 A few other stdlib/builtin gaps that are easy to reach for out of habit and will fail:
 - `collections` (including `Counter`) is not importable — use a plain `dict` with
   `d[key] = d.get(key, 0) + 1` instead of `Counter`.
+- `ipaddress` is not importable. For the limited address checks an analysis needs, work with the
+  string fields already present in the record (for example, compare an exact address or split an
+  IPv4 address on `.`); do not add an `ipaddress` import.
 - `socket`, `exec`, and `eval` are not available.
 - `os.listdir`, `os.walk`, and `os.path` have no members in this sandbox — list a directory
   with `pathlib.Path(p).iterdir()` and join paths with `pathlib.Path(a) / b`, not `os.path.join`.
+- `str.format()` is not available. Use simple f-strings without advanced format specifications,
+  or concatenate strings. In particular, do not use `"...".format(...)` as a fallback for an
+  unsupported f-string format.
 - `json.dumps(obj, default=str)` fails with `TypeError: JSONEncoder.__init__() got an
   unexpected keyword argument 'default'` — the `default=` kwarg isn't supported. Convert
   non-JSON-serializable values (e.g. cast to `str`/`int`) before calling `json.dumps`, not via
   a fallback hook.
 - f-string format specs don't support the comma thousands-separator (`f"{n:,}"` raises a
-  `SyntaxError`) — build the separators manually if needed, or just print the raw number.
+  `SyntaxError`) — do not retry with forms such as `f"{n:>8,d}"`; build the separators manually
+  if needed, or just print the raw number.
 - A `run_code` return value with a `dict` keyed by a non-string (e.g. a port number pulled
   straight from a log field, `results[dest_port] = ...`) fails tool-result validation with a
   `pydantic_core.ValidationError` like `Input should be a valid string [type=string_type,
@@ -97,6 +104,12 @@ restrictions block both. There is no "run this file" call. To reuse a saved scri
 its text and pass that text (edited as needed — e.g. a different input filename) as the `code`
 argument of your next `run_code` call. That resubmission *is* how reuse works here; treat the
 saved `.py` file as a code template you paste from, not a module you import.
+
+Do not try to bridge the FileSystem workspace with a relative `pathlib.Path("script.py")` inside
+`run_code`: that relative path is not the task workspace and commonly raises `FileNotFoundError`.
+Use the native `read_file(path="script.py")` tool to obtain code for resubmission. Use
+`pathlib.Path("/workspace/script.py")` only when sandboxed code genuinely needs to read or write
+an artifact by its absolute sandbox-mount path; it still cannot execute or import that file.
 
 ## Reuse Before Rewrite
 

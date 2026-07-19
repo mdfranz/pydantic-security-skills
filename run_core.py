@@ -376,6 +376,7 @@ class RunSetup:
     memory_scope: str | None
     run_stamp: str
     run_id: str
+    model: str
     audit: AuditLog
     agent: Agent
     run_metadata: dict
@@ -449,7 +450,7 @@ def prepare_run(
 
     audit = AuditLog(logs_dir, task_id, run_id)
     sink.status(
-        f"Task: {task_id} (mode: {mode}) -- workspace: {ws_path} -- "
+        f"Task: {task_id} (mode: {mode}) -- model: {args.model} -- workspace: {ws_path} -- "
         f"memory: {memory_scope if memory_enabled else 'disabled (pristine)'}"
     )
 
@@ -606,6 +607,7 @@ def prepare_run(
         memory_scope=memory_scope,
         run_stamp=run_stamp,
         run_id=run_id,
+        model=args.model,
         audit=audit,
         agent=agent,
         run_metadata=run_metadata,

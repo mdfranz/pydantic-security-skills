@@ -490,3 +490,10 @@ and `README.md` (`--ui`/optional-prompt examples, new "TUI mode" section, update
 **Result:** A second, fully opt-in UI for interactive investigation sessions, sharing 100% of run
 behavior with console mode through `run_core.py` — no divergence in artifacts, audit trail, or
 event vocabulary between the two.
+
+**Uncommitted documentation update (2026-07-19): Harden shared Monty sandbox guidance**
+- Reviewed runner audit logs and added explicit shared-prompt guidance for unavailable
+  `ipaddress` and `str.format()`, the unsupported comma variants of f-string formatting, and the
+  correct distinction between native `read_file` and relative `pathlib` access when reusing a
+  saved workspace script. This applies to every skill because `prompts/sandbox_notes.md` is
+  prepended to each skill prompt.
