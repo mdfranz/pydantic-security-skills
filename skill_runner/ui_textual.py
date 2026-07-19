@@ -6,17 +6,32 @@ a console-only install never imports textual."""
 
 import argparse
 import asyncio
+import os
 import signal
+import subprocess
 from datetime import datetime
 from functools import partial
+from pathlib import Path
 
+from rich.syntax import Syntax
 from rich.text import Text
 from textual import events, work
 from textual.app import App, ComposeResult
 from textual.command import Hit, Hits, Provider
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, DirectoryTree, Footer, Header, Input, Label, RichLog
+from textual.widgets import (
+    Button,
+    DataTable,
+    DirectoryTree,
+    Footer,
+    Header,
+    Input,
+    Label,
+    Markdown,
+    RichLog,
+    Static,
+)
 
 from .audit import RunInterrupted, make_event_stream_handler
 from .run_core import (
@@ -215,6 +230,112 @@ class QuitConfirmScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class FileViewerScreen(ModalScreen[None]):
+    """Read-only preview of a file picked in the artifacts tree -- Markdown renders
+    formatted (headers, tables, bold), .py gets syntax highlighting, everything else is
+    plain text. 'e' shells out to $EDITOR if set, since the tree is otherwise just a passive
+    listing with no way to act on what it shows."""
+
+    CSS = """
+    FileViewerScreen {
+        align: center middle;
+    }
+    #viewer-dialog {
+        width: 90%;
+        height: 90%;
+        border: thick $accent;
+        background: $panel;
+    }
+    #viewer-title {
+        dock: top;
+        background: $panel-lighten-1;
+        color: $text;
+        padding: 0 1;
+        height: 1;
+    }
+    #viewer-body {
+        padding: 1 2;
+    }
+    """
+
+    BINDINGS = [
+        ("escape", "close", "Close"),
+        ("q", "close", "Close"),
+        ("e", "open_editor", "Edit ($EDITOR)"),
+    ]
+
+    # Guards against loading something pathologically large (e.g. a misplaced data file)
+    # into a Rich renderable in memory -- generated_code/*.py and analyst_log-*.md are all
+    # comfortably under this in practice.
+    _MAX_PREVIEW_BYTES = 300_000
+
+    def __init__(self, path: Path):
+        super().__init__()
+        self.path = path
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="viewer-dialog"):
+            yield Static(self._title_text(), id="viewer-title", markup=False)
+            with VerticalScroll(id="viewer-body"):
+                yield from self._render_content()
+
+    def _title_text(self) -> str:
+        try:
+            size = self.path.stat().st_size
+        except OSError:
+            size = 0
+        editor_hint = " -- e: edit" if os.environ.get("EDITOR") else ""
+        return f"{self.path.name}  ({size:,} bytes) -- Esc/q: close{editor_hint}"
+
+    def _render_content(self):
+        try:
+            raw = self.path.read_bytes()
+        except OSError as e:
+            yield Static(f"Could not read file: {e}", markup=False)
+            return
+
+        truncated = len(raw) > self._MAX_PREVIEW_BYTES
+        if truncated:
+            raw = raw[: self._MAX_PREVIEW_BYTES]
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            yield Static(f"[binary file, {len(raw):,} bytes -- not previewable]", markup=False)
+            return
+        if truncated:
+            text += "\n\n... [truncated -- file exceeds the preview limit] ..."
+
+        # Markdown/Syntax are already Rich renderables, not plain str, so they never go
+        # through Static's markup parsing -- only the plain-text fallback needs markup=False
+        # to avoid the same "literal '[...]' silently eaten as a style tag" bug _cell_text()
+        # works around for the DataTable cells (e.g. read_file's own '[path | N lines | ...]'
+        # header would otherwise vanish here too).
+        suffix = self.path.suffix.lower()
+        if suffix == ".md":
+            yield Markdown(text)
+        elif suffix == ".py":
+            yield Static(Syntax(text, "python", line_numbers=True, word_wrap=True))
+        else:
+            yield Static(text, markup=False)
+
+    def action_close(self) -> None:
+        self.dismiss()
+
+    def action_open_editor(self) -> None:
+        editor = os.environ.get("EDITOR")
+        if not editor:
+            self.app.bell()
+            self.notify("No $EDITOR set -- can't open an external editor.", severity="warning")
+            return
+        with self.app.suspend():
+            subprocess.run([editor, str(self.path)])
+        # Content on disk may have just changed -- close rather than show a stale preview;
+        # reopening from the tree picks up the edit, and the artifacts panel needs a reload
+        # too in case the edit changed something write_file would otherwise have caught.
+        self.app.request_artifacts_reload()
+        self.dismiss()
+
+
 class ModelCommands(Provider):
     """Command-palette source listing every model in models.yaml. Ctrl+P already opens the
     palette (see the Footer's own '^p palette' hint) so this reuses that existing, always-
@@ -333,6 +454,9 @@ class AnalystApp(App):
 
     def request_artifacts_reload(self) -> None:
         self.artifacts_tree.reload()
+
+    def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
+        self.push_screen(FileViewerScreen(event.path))
 
     def set_model(self, model_id: str) -> None:
         """Called from the command palette (Ctrl+P -> pick a model from models.yaml). Takes
