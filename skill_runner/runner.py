@@ -83,6 +83,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="The maximum number of tokens to generate before stopping.",
     )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=5,
+        help="Max retries for a failing run_code call (syntax/runtime errors count as retries) "
+        "before the turn aborts with UnexpectedModelBehavior. Default: 5.",
+    )
+    parser.add_argument(
+        "--max-run-seconds",
+        type=int,
+        default=None,
+        help="Wall-clock budget per turn. If a single turn (one submitted prompt, including all "
+        "its tool calls) runs longer than this, it's cleanly interrupted the same way Ctrl+C/"
+        "SIGTERM is -- partial progress is preserved, the audit log records the interruption, and "
+        "the process exits 143. Default: no limit.",
+    )
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=None,
+        help="Max model round-trips (requests) per turn, passed through to pydantic_ai's "
+        "UsageLimits.request_limit. Default: pydantic_ai's own default (50).",
+    )
     return parser
 
 
@@ -123,10 +146,15 @@ def main():
             run_console(skill_dir, initial_prompt, options)
     except TaskError as e:
         parser.error(str(e))
+    except RunInterrupted:
+        # Caught here, not just under `if __name__ == "__main__"` below -- the installed
+        # `skill-runner` console script (pyproject.toml's `skill-runner = "skill_runner.runner:
+        # main"`, what `uv run skill-runner` actually invokes) calls main() directly and never
+        # goes through that guard, so a version living only there never ran in practice for the
+        # primary entry point. Ctrl+C, SIGTERM, and --max-run-seconds all raise RunInterrupted by
+        # design (see audit.py) and rely on this mapping for a clean exit instead of a traceback.
+        map_run_interrupted_exit_code()
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except RunInterrupted:
-        map_run_interrupted_exit_code()
+    main()

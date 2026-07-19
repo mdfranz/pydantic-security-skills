@@ -6,9 +6,10 @@ from enum import Enum
 from typing import Any
 
 from pydantic_ai.messages import ModelMessage
+from pydantic_ai.usage import UsageLimits
 
 from .artifacts import Transcript, Turn, write_artifacts
-from .audit import RunInterrupted, make_event_stream_handler, restore_sigterm_handler
+from .audit import RunInterrupted, make_event_stream_handler, restore_sigterm_handler, start_turn_watchdog
 from .run_core import RunSetup, RunSink
 from .script_lint import lint_and_fix_scripts
 
@@ -87,10 +88,13 @@ class RunSession:
             kwargs["message_history"] = self.message_history
         if model is not None:
             kwargs["model"] = model
+        if self.setup.options.max_turns is not None:
+            kwargs["usage_limits"] = UsageLimits(request_limit=self.setup.options.max_turns)
         return kwargs
 
     def submit_sync(self, prompt: str):
         effective_prompt = self._begin_turn(prompt)
+        watchdog = start_turn_watchdog(self.setup.options.max_run_seconds)
         try:
             result = self.setup.agent.run_sync(effective_prompt, **self._run_kwargs())
             self._record_success(prompt, effective_prompt, result, self.setup.model)
@@ -100,11 +104,15 @@ class RunSession:
         except Exception as exc:
             self.fail(exc)
             raise
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
         return result
 
     async def submit_async(self, prompt: str, *, model: str | None = None):
         effective_prompt = self._begin_turn(prompt)
         selected_model = model or self.setup.model
+        watchdog = start_turn_watchdog(self.setup.options.max_run_seconds)
         try:
             result = await self.setup.agent.run(
                 effective_prompt,
@@ -117,6 +125,9 @@ class RunSession:
         except Exception as exc:
             self.fail(exc)
             raise
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
         return result
 
     def _record_success(self, submitted_prompt: str, effective_prompt: str, result, model: str) -> None:

@@ -146,6 +146,13 @@ also triggered by the same `f"...{x:,}"` comma-format-specifier syntax error, al
 defeating the same model is stronger grounds for raising `CodeMode`'s `max_retries` default (see
 the `--max-retries`/`--max-run-seconds` CLI discussion below) than a single incident would be.
 
+**Update**: `--max-retries` is now implemented (default raised from `CodeMode`'s built-in 3 to 5)
+— see issue #13. The `UnexpectedModelBehavior` clean-exit catch suggested above turned out to
+already exist in code, but only under `runner.py`'s `if __name__ == "__main__":` guard, which the
+real `skill-runner` entry point never runs through — see #13 for the full story. Only the
+`RunInterrupted` half of that gap is fixed so far; `UnexpectedModelBehavior` itself is still
+uncaught by `main()` and still exits with a raw traceback.
+
 ## 6. `qwen3.6-flash` reproducibly dumps every Suricata `stats` event verbatim, blowing the context window
 
 During the same `--pristine` comparison matrix, `qwen3.6-flash`'s rep-3 run crashed with:
@@ -303,3 +310,85 @@ feedback at all: `--model haiku-4.5` and `--model haiku-4-5` (the catalog's actu
 like a plausible `provider:model` string (e.g. no `:` separator), have the CLI print the
 close/available aliases before making any request — cheap to add, and turns an opaque 400+ round
 trip into an immediate, actionable message.
+
+## 12. Network-level exceptions crash the run exactly like issue #5, and one produced a ~2-hour silent hang with no wall-clock safety net
+
+A second `--pristine`/`--logfire` OpenRouter comparison (deepseek-v4-pro, kimi-k3, minimax-m3 —
+same prompt/data/skill as the first) turned up a failure class distinct from anything in issues
+#5-#6: raw network/provider exceptions, uncaught, exactly like issue #5's `UnexpectedModelBehavior`
+crash. `kimi-k3` failed all 3 reps — 2 with `pydantic_ai.exceptions.ModelHTTPError: status_code:
+429 ... temporarily rate-limited upstream ... retry_after_seconds: 1`, one with a bare
+`httpx.ReadTimeout`. `minimax-m3` failed 2 of 3 reps: one with issue #5's own retry-exhaustion
+pattern, one with another `httpx.ReadTimeout`.
+
+**The `httpx.ReadTimeout` cases are the concerning part.** These aren't quick failures:
+
+- `kimi-k3` rep 1: audit log shows the last real activity (a `write_file` tool result) at
+  `15:37:40 UTC`; `ReadTimeout` didn't fire until `17:34:32 UTC` — a **silent ~1h57m stall** on
+  what should have been the next model response, for a total run duration of 7,737 seconds (~2h9m)
+  before producing anything. Task: `task-4605d7d6-cb46-4a0f-9be3-9dce905cacbc`.
+- `minimax-m3` rep 3: a shorter but still severe ~10-minute stall (`17:52:28` →`18:02:38`) after
+  what looked like a completed turn, for a 1,115s total run. Task:
+  `task-d39f5931-5975-4a83-8077-6aad10b55d5d`.
+
+Both ended with nothing to show for the wait — no partial report, no partial `generated_code/`
+snapshot beyond whatever the last successful turn had already checkpointed, and (same as issue #5)
+a raw multi-frame traceback to the terminal rather than a clean error.
+
+This is the single strongest piece of evidence yet for the `--max-run-seconds` wall-clock-budget
+CLI flag discussed alongside issues #5/#6 (see `results/pristine-model-comparison-2026-07-19.md`'s
+duration section, where GLM-5.2 was slow-but-making-progress at 500-800s) — a 2-hour dead stall
+producing zero output is a fundamentally worse failure than "thorough but slow," and neither
+`CodeMode.max_retries` nor `UsageLimits.request_limit` would catch it, since nothing ever gets far
+enough to retry or spend another turn.
+
+Separately, the two `429` cases are notable because the provider's own response explicitly said
+`retry_after_seconds: 1` — a signal that a 1-second backoff-and-retry would very likely have
+succeeded — yet the run failed immediately rather than retrying. Worth checking whether
+`pydantic_ai`'s OpenRouter provider (or the underlying OpenAI-compatible client it wraps) has any
+built-in retry-on-429 behavior at all, since none was observed here.
+
+**Suggested fix**: same `runner.py::main()` catch-and-clean-exit fix as issue #5, broadened to
+network-layer exceptions (`httpx.ReadTimeout`, `pydantic_ai.exceptions.ModelHTTPError`), not just
+`UnexpectedModelBehavior`. Independently, the `--max-run-seconds` wall-clock cap from the
+`--max-retries`/`--max-turns` CLI discussion would bound the damage from a hang like kimi-k3's
+regardless of cause. And consider a single top-level retry (with the provider's own
+`retry_after_seconds` as the delay) for 429 responses specifically, before giving up.
+
+**Update**: `--max-retries`, `--max-run-seconds`, and `--max-turns` are now implemented (see issue
+#13) — `--max-run-seconds` directly bounds a hang like kimi-k3's regardless of cause. The
+`UnexpectedModelBehavior`/`ModelHTTPError`/`ReadTimeout` clean-exit catch from issue #5's suggested
+fix (broadened here to network exceptions) is still open — only the `RunInterrupted` half of that
+fix shipped as part of #13, since it was a hard blocker for `--max-run-seconds` itself.
+
+## 13. `RunInterrupted`'s exit-143 mapping never actually ran via the real `skill-runner` entry point — Ctrl+C/SIGTERM crashed with a raw traceback all along
+
+Discovered while validating `--max-run-seconds` (issue #12's fix, below): a run interrupted by the
+new watchdog exited with a raw multi-frame traceback and exit code 1, not the clean "exit 143, no
+traceback" behavior `audit.py`'s `RunInterrupted`/`map_run_interrupted_exit_code()` are explicitly
+designed to produce (see that module's own docstrings, and `refs/textual-ui-plan.md`'s "top-level
+`RunInterrupted` → exit `143` mapping").
+
+Root cause: `runner.py`'s `main()` only ever caught `TaskError`. The `except RunInterrupted:
+map_run_interrupted_exit_code()` mapping existed, but only under `if __name__ == "__main__":` at
+the bottom of the file — which runs when `runner.py` is executed directly (`python
+skill_runner/runner.py`), but **not** when invoked through the installed console-script entry
+point, `pyproject.toml`'s `skill-runner = "skill_runner.runner:main"`. That entry point's
+auto-generated shim (`.venv/bin/skill-runner`) does `from skill_runner.runner import main;
+sys.exit(main())` directly — it never touches the `__main__` guard, so the mapping silently never
+ran. Confirmed via the actual crash traceback: `File ".../bin/skill-runner", line 10, in <module>
+sys.exit(main())`.
+
+Since `skill-runner`/`uv run skill-runner` (not `python skill_runner/runner.py`) is how this tool
+is actually invoked everywhere in this repo (`README.md`, `compare_models.sh`, every test run in
+`results/*.md`), **this means real Ctrl+C and SIGTERM have crashed with a raw traceback and exit
+code 1 instead of a clean exit 143 for as long as the console-script entry point has existed** —
+this issue's own earlier entries (#5, #12) mischaracterized `main()` as already catching
+`RunInterrupted` when suggesting it be "broadened"; it was never catching it at all.
+
+**Mitigation shipped**: moved the `except RunInterrupted: map_run_interrupted_exit_code()` clause
+into `main()` itself (`runner.py`), alongside the existing `except TaskError`, so it runs
+regardless of entry point. The `if __name__ == "__main__":` block is now a trivial `main()` call.
+Verified end-to-end: `--max-run-seconds 5` against a real model now exits `143` with no traceback,
+and the audit log shows a clean `interrupted` → `run_end status=failed` sequence instead of an
+`error` event.

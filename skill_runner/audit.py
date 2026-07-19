@@ -2,8 +2,10 @@
 stream handler that feeds both the audit log and whichever UI sink is active."""
 
 import json
+import os
 import signal
 import sys
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -45,6 +47,25 @@ def install_sigterm_handler() -> Any:
 def restore_sigterm_handler(previous_handler: Any) -> None:
     """Restore the handler that was active before this run took ownership of SIGTERM."""
     signal.signal(signal.SIGTERM, previous_handler)
+
+
+def start_turn_watchdog(seconds: int | None) -> threading.Timer | None:
+    """Enforce a wall-clock budget on the turn about to run by delivering this process its own
+    SIGTERM after `seconds` -- reusing install_sigterm_handler's existing conversion to
+    RunInterrupted rather than inventing a second interruption path, since a stuck turn (an agent.
+    run/run_sync call that's genuinely hung -- e.g. a provider connection that never returns, as
+    opposed to GLM-5.2 just being slow but making steady progress) needs the exact same clean
+    shutdown as Ctrl+C: audit log closed, partial artifacts kept, exit 143. A background thread
+    can signal the main thread this way because the interpreter always runs the registered Python
+    signal handler on the main thread regardless of which thread called os.kill/raise_signal.
+    Returns None (nothing to cancel) when no budget is set. Caller must .cancel() the timer once
+    the turn finishes on its own, or this fires late and interrupts a future, unrelated turn."""
+    if seconds is None:
+        return None
+    timer = threading.Timer(seconds, os.kill, args=(os.getpid(), signal.SIGTERM))
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 def map_run_interrupted_exit_code() -> None:

@@ -244,6 +244,7 @@ def _build_agent(context: WorkspaceContext, options: RunOptions, instructions: s
         FileSystem(root_dir=str(context.ws_path)),
         CodeMode(
             tools=[],
+            max_retries=options.max_retries,
             mount=[
                 MountDir(SANDBOX_WORKSPACE_MOUNT, str(context.ws_path), mode="read-write"),
                 MountDir(SANDBOX_SKILL_MOUNT, str(context.skill_path.resolve()), mode="read-only"),

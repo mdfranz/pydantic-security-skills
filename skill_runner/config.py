@@ -29,6 +29,9 @@ class RunOptions:
     thinking: ThinkingEffort | None = None
     max_tokens: int | None = None
     ui: UiMode = "console"
+    max_retries: int = 5
+    max_run_seconds: int | None = None
+    max_turns: int | None = None
 
     @classmethod
     def from_namespace(cls, args: argparse.Namespace) -> RunOptions:
@@ -43,6 +46,9 @@ class RunOptions:
             thinking=cast(ThinkingEffort | None, args.thinking),
             max_tokens=args.max_tokens,
             ui=cast(UiMode, args.ui),
+            max_retries=args.max_retries,
+            max_run_seconds=args.max_run_seconds,
+            max_turns=args.max_turns,
         )
 
     def with_model(self, model: str) -> RunOptions:
