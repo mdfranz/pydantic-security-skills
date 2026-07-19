@@ -1267,6 +1267,7 @@ name = "pydantic-security-skills"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "anyio" },
     { name = "logfire", extra = ["system-metrics"] },
     { name = "pydantic-ai" },
     { name = "pydantic-ai-harness", extra = ["codemode"] },
@@ -1280,6 +1281,7 @@ tui = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", specifier = ">=4.0" },
     { name = "logfire", extras = ["system-metrics"], specifier = ">=4.37.0" },
     { name = "pydantic-ai", specifier = ">=2.9.1" },
     { name = "pydantic-ai-harness", extras = ["codemode"], specifier = ">=0.7.0" },

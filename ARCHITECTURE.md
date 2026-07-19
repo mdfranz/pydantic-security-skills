@@ -21,11 +21,14 @@ flowchart TB
         Agent["Agent (pydantic-ai)"]
         FS["FileSystem capability"]
         CM["CodeMode capability"]
+        Overflow["OverflowingToolOutput capability"]
+        ProviderHooks["Provider hooks\none bounded 429 retry"]
         Think["Thinking capability (optional)"]
         Mem["Memory capability\n(accumulate mode only)"]
         TaskWs[("Task workspace\nworkspace/<task>/")]
         Data[("Input data (read-only)\nworkspace/data/")]
         Logs[("Audit log (host-only)\nworkspace/logs/")]
+        Spills[("Oversized tool returns\nworkspace/logs/overflow/<task>/")]
         MemStore[("Memory notebook\nworkspace/memory/<skill>/<task>/")]
         Monty["Monty sandbox"]
         Session["RunSession\nturn state + transcript + lifecycle"]
@@ -36,10 +39,13 @@ flowchart TB
         Session -- "submit_sync / submit_async" --> Agent
         Agent --> FS
         Agent --> CM
+        Agent --> Overflow
+        Agent --> ProviderHooks
         Agent -.-> Think
         Agent -.-> Mem
         FS -- "native calls (task-scoped root)" --> TaskWs
         CM --> Monty
+        Overflow -- "spill full value / return preview" --> Spills
         Mem -- "native calls + bounded injection\n(scoped to <skill>/<task>, never mounted)" --> MemStore
         Monty -- "mount /workspace (rw)" --> TaskWs
         Monty -- "mount /data (ro)" --> Data
@@ -150,8 +156,7 @@ manages by hand.
 
 ### Capabilities
 
-Up to four capabilities compose to define what the agent can actually do, each independent of the
-others:
+Capabilities compose to define what the agent can actually do, each independent of the others:
 
 - **`FileSystem`** — ordinary, native tools (list/read/write/search) scoped to the current task's
   workspace directory (`workspace/<task>/`), never the workspace base. This is how the agent
@@ -163,9 +168,17 @@ others:
   tools (`FileSystem`'s tools stay native); `run_code` exists purely as a Python execution
   surface for log analysis, not as a wrapper around other capabilities. This is a deliberate,
   non-default configuration choice — see `PYDANTIC-STACK.md` §4 for why.
-- **`Thinking`** (conditional) — requests extended reasoning from the model. Unlike the other
-  two, it doesn't gate or wrap anything else; it's purely additive and only present when
-  requested.
+- **`OverflowingToolOutput`** — intercepts every tool result before it enters model history. At
+  10,000 characters it stores the complete value in the task-scoped, owner-only
+  `workspace/logs/overflow/<task>/` store and substitutes a bounded preview plus an opaque
+  `read_tool_result` handle; if storage fails, it falls back to a 4,000-character truncation.
+  Spill handles and original byte counts are copied into the audit event.
+- **Provider hooks** — retry an individual model request once on HTTP 429, using OpenRouter's
+  `metadata.retry_after_seconds` when present and clamping the wait to 0.1–30 seconds. Retrying at
+  the request boundary preserves completed tool work and avoids replaying the whole agent run.
+- **`Thinking`** (conditional) — requests extended reasoning from the model. Unlike the tool and
+  wrapper capabilities, it doesn't gate or wrap anything else; it's purely additive and only
+  present when requested.
 - **`Memory`** (accumulate mode only) — a persistent, per-`<skill>/<task>` `MEMORY.md` notebook,
   auto-injected into every model request (bounded, ~2k tokens) plus `read_memory`/`write_memory`/
   `search_memory` tools for longer topic files. Backed by `pydantic_ai_harness.memory.FileStore`,
@@ -214,8 +227,9 @@ summarizes:
   through the `Memory` capability's own tools and its bounded automatic injection — never through
   `FileSystem` or a mount. Accumulates identically to scripts in accumulate mode; the capability
   is omitted entirely in pristine mode, so no scope for that task ever exists.
-- **`logs/`** — a flat, host-only audit domain (see below), a sibling of the task directories and
-  therefore outside every task's writable root.
+- **`logs/`** — host-owned runtime records (see below), a sibling of the task directories and
+  therefore outside every task's writable root. Audit JSONL files are flat at its root; complete
+  oversized tool returns are nested under `overflow/<task>/`.
 
 The isolation guarantee — an agent in one task can never read another task's directory or the
 audit log — holds only because the task root stays a validated, real, direct child of the
@@ -224,7 +238,7 @@ preserve. `Memory`'s scope isolation is a separate, complementary guarantee: eve
 prefixed server-side by `<skill>/<task_id>`, so one shared store root can't leak notes across
 tasks even though it isn't filesystem-mount-based like the other three domains.
 
-### Audit log (`workspace/logs/`)
+### Audit log and overflow store (`workspace/logs/`)
 
 An append-only, host-only JSON Lines event stream, one file per run
 (`runner-<task>-<run-id>.jsonl`), a flat sibling of the task directories — not nested inside any
@@ -232,6 +246,12 @@ of them, which is what keeps it unreachable through `FileSystem` or the sandbox'
 the old console transcript it replaces, events (configuration, prompts, every tool call/result,
 `run_code` bodies and returns, errors, completion) are flushed as they happen via pydantic-ai's
 `event_stream_handler`, so a failed or interrupted run still leaves a complete record.
+
+The same host-owned tree contains `overflow/<task>/<run-id>/<tool-call-id>.<retry>` files for tool
+returns too large to place in model history. The model cannot browse this directory through
+`FileSystem` or Monty; it can only request bounded slices using the opaque handle registered by
+`OverflowingToolOutput`. The corresponding tool-result audit event records the handle and full
+byte count without duplicating the complete payload into JSONL.
 
 Two hardening details address the "Retention and permissions" open item in
 `refs/workspace-lifecycle.md`:
@@ -278,7 +298,8 @@ flowchart LR
         H2["reads skill directory"]
         H3["real env vars, real network"]
         H4["writes audit log / report / generated_code"]
-        H5["reads workspace/logs/ (audit) —\nnever exposed to agent"]
+        H5["reads workspace/logs/ audit JSONL —\nnever exposed to agent"]
+        H6["stores oversized tool results —\nreadable only in bounded handle slices"]
     end
 
     subgraph Sandbox["Monty sandbox — near-zero ambient access"]

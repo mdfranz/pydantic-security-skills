@@ -627,3 +627,24 @@ Ctrl+C/SIGTERM safety net since Phase 13. Three now have shipped fixes: retry ex
 (`--max-retries`), unbounded hangs (`--max-run-seconds`), and the exit-code bug itself. Six remain
 open and documented for follow-up (Monty stdlib gaps, the `FileSystem` path-confusion error, model
 CLI validation, and the qwen3.6-flash-specific crash patterns' upstream mitigations).
+
+---
+
+### Phase 16: Runtime Output and Provider Resilience (2026-07-19)
+
+**Objective:** Enforce the tool-output boundary at runtime and tolerate a transient provider rate
+limit without replaying an agent run.
+
+- Added `OverflowingToolOutput` to every agent. Tool returns at or above 10,000 characters are
+  stored in an owner-only, task-scoped `workspace/logs/overflow/<task>/` store before model
+  history is assembled; the model receives a bounded preview and `read_tool_result` handle, with
+  a 4,000-character truncation fallback if persistence fails.
+- Extended tool-result audit events with the spill handle and original byte count, preserving a
+  durable link to the complete output without copying that output into the JSONL record.
+- Added a provider request hook that retries HTTP 429 once, honors
+  `metadata.retry_after_seconds`, clamps waits to 0.1–30 seconds, and audits the retry. Other HTTP
+  failures and a second 429 still propagate normally.
+
+**Result:** Issues #2/#6 no longer rely on prompt compliance to protect model context, and a
+transient OpenRouter/Kimi rate limit gets one bounded retry at the failed request boundary rather
+than requiring a monkeypatch or replaying completed tool calls.

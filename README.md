@@ -15,8 +15,12 @@ threats, suspicious egress, protocol anomalies).
 ## Further reading
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — components, structure, and trust boundaries.
+- [`skill_runner/IMPL.md`](skill_runner/IMPL.md) — implementation-level reference for the
+  `skill_runner` package: types, functions, control flow, and gotchas.
 - [`PYDANTIC-STACK.md`](PYDANTIC-STACK.md) — how the pydantic-ai/harness/Monty stack is wired
   together, and why.
+- [`PKG.md`](PKG.md) — 3rd party dependencies, classified by role, with direct-vs-indirect and
+  where each is actually imported.
 - [`PROJECT.md`](PROJECT.md) — development history and design decisions by phase.
 - [`ISSUES.md`](ISSUES.md) — known issues and improvement backlog, evidenced from real runs.
 
@@ -26,7 +30,7 @@ threats, suspicious egress, protocol anomalies).
 - `--workspace` (default `./workspace`) is the **case root**, not the agent's own directory. It
   has four subtrees: `data/` (canonical input evidence, read-only), one directory per *task*
   (the agent's writable workspace — see below), `memory/` (per-task notebook, tool-visible only —
-  see below), and `logs/` (host-only audit records, never visible to the agent).
+  see below), and `logs/` (host-owned runtime records, never filesystem-visible to the agent).
 - The agent gets a `FileSystem` capability scoped to the current task's directory
   (`<workspace>/<task>/`, read/write/search files), called natively — `CodeMode` is configured
   with `tools=[]`, so it doesn't wrap any tool behind `run_code`; `run_code` is purely a sandboxed
@@ -39,6 +43,11 @@ threats, suspicious egress, protocol anomalies).
   notebook, auto-injected (bounded) into every request, plus `read_memory`/`write_memory`/
   `search_memory` tools for longer topic files — native, like `FileSystem`, never routed through
   `run_code` or mounted into the sandbox. Omitted entirely in `--pristine` mode.
+- Tool returns at or above 10,000 characters are spilled under the owner-only
+  `<workspace>/logs/overflow/<task>/` store before they enter model history. The model receives a
+  bounded preview and an opaque `read_tool_result` handle; the audit event records that handle and
+  the original byte count. Provider HTTP 429 responses are retried once, honoring a bounded
+  `retry_after_seconds` value when supplied.
 - Analysis is native Python + `json` only — Monty permits a fixed stdlib subset (`sys`, `typing`,
   `asyncio`, `math`, `json`, `re`, `datetime`, `os`, `pathlib`), no third-party imports and no class
   definitions, so DuckDB/Polars/pandas can never run inside the sandbox regardless of what a skill
@@ -131,10 +140,13 @@ Every run also retains artifacts. Inside the task directory (`<workspace>/<task>
 `generated_code/` contains each generated `run_code` program, and
 `analyst_log-YY-MM-DD_HH-MM-SS.md` contains the final analysis response. The agent is additionally
 instructed to save reusable scripts and intermediate findings with the filesystem tools. Outside
-the task directory, in `<workspace>/logs/` (not agent-visible), `runner-<task>-<run-id>.jsonl`
+the task directory, in `<workspace>/logs/` (not filesystem-visible to the agent),
+`runner-<task>-<run-id>.jsonl`
 holds a complete append-only audit trail of the run — configuration, prompts, every tool call and
 result, `run_code` bodies/returns, errors, and completion — richer than a console transcript so
-even a failed or interrupted run leaves a durable record. In accumulate mode, `<workspace>/memory/
+even a failed or interrupted run leaves a durable record. Oversized tool returns are stored under
+`<workspace>/logs/overflow/<task>/`; they are outside the agent's filesystem but can be read in
+bounded slices through the audited handle. In accumulate mode, `<workspace>/memory/
 <skill>/<task>/MEMORY.md` holds whatever the agent chose to persist via `write_memory` — reachable
 only through the memory tools, never through `FileSystem` or `list_directory`.
 

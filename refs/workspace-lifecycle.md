@@ -42,7 +42,8 @@ Every file belongs to one of four domains, which decides whether and how the age
 | `analyst_log-*.md` analysis reports | Agent | The runner, assembled from the completed conversation *after* the run ends | `workspace/<task>/` | yes, but only if the agent finds it — reachable via `list_directory`/`read_file`, never injected into the prompt |
 | `generated_code/*.py` (run_code copies) | Agent | The runner, one file per `run_code` call, written *after* the run ends | `workspace/<task>/` | yes, but only if the agent finds it — same as above; this is an unconditional capture of every `run_code` call regardless of success, not something the agent chose to save |
 | `MEMORY.md` + topic files | Memory | The agent, via the `write_memory` tool (mediated by the `Memory` capability, not `FileSystem`) | `workspace/memory/<skill>/<task>/` | yes, but never through the filesystem — only via `write_memory`/`read_memory`/`search_memory`/`delete_memory` and a bounded automatic injection into every model request; never `list_directory`/`read_file` or any mount |
-| `runner-<task>-<run-id>.jsonl` audit record | Host audit | The runner, incrementally as the run progresses | `workspace/logs/` (flat) | **no** |
+| `runner-<task>-<run-id>.jsonl` audit record | Host | The runner, incrementally as the run progresses | `workspace/logs/` (flat) | **no** |
+| Oversized tool return | Host | `OverflowingToolOutput`, before model history | `workspace/logs/overflow/<task>/<run-id>/` | only in bounded slices through an opaque `read_tool_result` handle; never through the filesystem |
 
 **Input domain** = canonical source evidence supplied by the operator. It lives in
 `workspace/data/`; the runner mounts it at `/data` read-only. It is intentionally shared between
@@ -84,18 +85,15 @@ empty scope), so a pristine run's tool surface and prompt token count stay ident
 — see *Isolation guarantee* below and `scripts/compare_models.sh`, whose entire purpose depends on
 that.
 
-**Host audit domain** = an append-only event record *about* the run, not an input to it. Today a
-console transcript is written into the task workspace, which means the agent can `read_file()`
-it and the sandbox can read it via the mount — both context pollution and a leak of host-side
-framing into the agent's view. This is not a theoretical risk: this project's own telemetry shows
-the agent has already `read_file`'d a `runner-*.log` transcript at least once. It moves to
-`workspace/logs/`, a flat sibling of the task dirs,
-with the task id and a unique run id in each filename. That directory is under the same
-`workspace/` base but **not** under any `<task>/` subtree, so it is outside the agent's reach
-(see *Isolation guarantee* below).
+**Host domain** = runtime records kept outside the task directory. The append-only audit event
+stream is about the run, not an input to it; each flat JSONL filename carries the task id and a
+unique run id. Complete oversized tool returns live separately under
+`workspace/logs/overflow/<task>/`. The `logs/` directory is a sibling of the task dirs, so neither
+record type is filesystem-visible to the agent. Spill contents can only be retrieved in bounded
+slices through `read_tool_result` using an opaque handle (see *Isolation guarantee* below).
 
-> Only audit records leave the task directory. `analyst_log-*.md` and `generated_code/` write
-> under `workspace/<task>/` and stay there.
+> Only host runtime records leave the task directory. `analyst_log-*.md` and `generated_code/`
+> write under `workspace/<task>/` and stay there.
 
 ## Workspace identity and modes
 
@@ -149,12 +147,21 @@ backend implementation ever returns a path outside that scope. `workspace/logs/`
 task's memory scope stay unreachable through this channel for the same reason `workspace/logs/`
 stays unreachable through the four filesystem access points below: the scope prefix, like the task
 root, is never a value the agent supplies. Omitted entirely in pristine mode, so a pristine run has
-no fifth access point at all.
+no memory access point at all.
+
+**A bounded spill read-back channel: `read_tool_result`.** `OverflowingToolOutput` always exposes
+this tool so the model can retrieve slices of an oversized return by opaque handle. The backing
+store is fixed server-side to `workspace/logs/overflow/<task>/`; the model cannot choose or
+browse a host path, escape that task's spill root, or receive more than the tool's built-in line
+and character caps in one call. This is deliberate content access to a specific tool result, not
+filesystem access to `workspace/logs/`.
 
 The two writable workspace-side access points are scoped to `workspace/<task>/`; `/data` grants
 only read access to the dedicated input directory; and the skill mount is outside `workspace/`
-altogether. Thus anything else under `workspace/`, including `workspace/logs/` and every other
-task directory, is unreachable. Four conditions keep this true:
+altogether. Thus anything else under `workspace/`, including audit JSONL, the spill directory as
+a filesystem, and every other task directory, is unreachable through those surfaces. The bounded
+spill read-back channel above is the sole deliberate exception for spill contents. Four
+conditions keep the filesystem guarantee true:
 
 1. **The root and mount must stay the task subdir.** The entire guarantee is "agent root =
    `workspace/<task>/`." If either is ever pointed at the `workspace/` base, `logs/` leaks. This
@@ -191,15 +198,21 @@ workspace/                                # base (--workspace, default ./workspa
         MEMORY.md
       suricata-triage/
         MEMORY.md
-  logs/                                   # reserved; flat; host audit  ← NOT agent-visible
+  logs/                                   # reserved; host runtime records  ← NOT filesystem-visible
     runner-default-<run-id>.jsonl         # task name is in the filename
     runner-suricata-triage-<run-id>.jsonl
     runner-task-9f2a1c7b4e0d-...-<run-id>.jsonl
+    overflow/                             # owner-only full tool returns; not filesystem-visible
+      default/
+        <run-id>/
+          <tool-call-id>.0
 ```
 
-`logs/` is flat — one append-only JSON Lines event stream per run, with the task id and unique
-run id in the filename — so an audit record maps one-to-one to its task without nesting. It sits
-beside the task dirs, not inside any of them, which is what keeps it out of the agent's reach.
+Audit files at the root of `logs/` are flat — one append-only JSON Lines event stream per run,
+with the task id and unique run id in the filename — so an audit record maps one-to-one to its
+task. Oversized tool results are nested separately under `logs/overflow/<task>/`; they remain
+outside filesystem and sandbox access, while `read_tool_result` can retrieve a bounded slice by
+opaque handle. Both stores sit beside the task dirs, not inside any of them.
 
 `memory/` is a flat sibling too, but nested one level deeper than `logs/` — by skill, then task —
 since a single `Memory` store root hosts every skill's and task's notebook, each isolated by its
@@ -365,6 +378,11 @@ discovery. No change to Monty's execution model is required.
   `run_code` bodies and returns, errors, and completion. This is deliberately richer than the
   current console transcript, so failed or interrupted runs retain their audit evidence.
   `report_path` and `generated_dir` remain under `ws_path`.
+- **Bound tool results** before model history: spill returns at or above 10,000 characters to
+  `logs_dir/overflow/<task_id>/<run-id>/`, substitute a bounded preview and opaque handle, and
+  record that handle and the original byte count in the audit event. The spill root is owner-only
+  and task-scoped; storage failure falls back to truncation rather than admitting an unbounded
+  result into context.
 - **Startup message** reports the task id and mode so a run's identity is obvious in the log.
 - **Telemetry:** keep a stable agent name (normally the skill name) and attach `task_id` and
   `run_id` as run metadata/span attributes. Agent name is a logging identity, not a workspace
@@ -395,7 +413,8 @@ under `data/`.
 ## Open items
 
 - **Retention and permissions:** audit records can contain prompts, tool data, generated code,
-  model responses, and reasoning. Set restrictive host permissions and define size/age retention
+  model responses, and reasoning; overflow files contain complete tool returns. Both are stored
+  below the owner-only `logs/` tree and persist without an automatic TTL. Define size/age retention
   before enabling this on sensitive or long-lived cases. Pristine task directories also persist;
   cleanup, if wanted, must be a separate explicit action.
 - **Memory retention:** `workspace/memory/<skill>/<task>/` persists indefinitely per accumulate

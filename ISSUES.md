@@ -33,7 +33,7 @@ count table) is likely to be reused, and to check for/reuse that cache before re
 Given the file is ~1000x larger than suricata's `eve.json`, this is much higher-value for
 osqueryd-analyst than for suricata-analyst.
 
-## 2. Token-overflow risk for large osqueryd logs
+## 2. [Mitigated] Token-overflow risk for large osqueryd logs
 
 Earlier the same day (before the current Sandbox Notes existed), a suricata-analyst run hit:
 
@@ -46,12 +46,15 @@ caused by printing too much raw data into the model's own context instead of agg
 code. That failure hasn't recurred since (current sampling in both skills is capped at 5 lines
 for schema discovery), but osqueryd's input file is far larger than the eve.json that triggered
 it, and the process-lineage / shell-history dumps observed on 07-17 already print dozens of
-multi-line entries per call. There's no explicit guardrail against this in either skill.
+multi-line entries per call. At the time of the finding, there was no runtime guardrail against
+this in either skill.
 
-**Suggested fix**: Add an explicit reminder to both skills' "Python Style" / Working Agreements
-— aggregate and summarize in code, and only print bounded/paginated output (a top-N table, not
-full per-record dumps) — with a concrete cap (e.g. "print at most ~50 lines of detail per
-`run_code` call unless explicitly asked for a full listing").
+**Mitigation shipped**: The prompt-level ~50-line instruction remains useful guidance, but runtime
+enforcement no longer depends on model compliance. `OverflowingToolOutput` now intercepts every
+tool result at 10,000 characters, preserves the complete value under the owner-only,
+task-scoped `workspace/logs/overflow/<task>/` store, and puts only a bounded preview plus an opaque
+read handle into model history. If the spill fails, a 4,000-character truncation prevents the
+original result from entering context. The audit event records the handle and original byte count.
 
 ## 3. `if __name__ == "__main__":` kept recurring despite documentation — worth a Monty-side fix?
 
@@ -153,7 +156,7 @@ real `skill-runner` entry point never runs through — see #13 for the full stor
 `RunInterrupted` half of that gap is fixed so far; `UnexpectedModelBehavior` itself is still
 uncaught by `main()` and still exits with a raw traceback.
 
-## 6. `qwen3.6-flash` reproducibly dumps every Suricata `stats` event verbatim, blowing the context window
+## 6. [Mitigated] `qwen3.6-flash` dumps every Suricata `stats` event verbatim, blowing the context window
 
 During the same `--pristine` comparison matrix, `qwen3.6-flash`'s rep-3 run crashed with:
 
@@ -183,15 +186,13 @@ near this size.
 
 This is issue #2 ("Token-overflow risk for large osqueryd logs") recurring on suricata-analyst,
 which issue #2 explicitly said "hasn't recurred since" — that was true only for the models tested
-at the time; it was never fixed at the tool/skill level, just not re-triggered until this model was
-tried.
+at the time; it had not been fixed at the tool/skill level, just not re-triggered until this model
+was tried.
 
-**Suggested fix**: issue #2's suggested fix (an explicit line-count/size cap on `run_code` print
-output, documented in both skills) applies directly and would have caught this. Given it's
-specifically the `stats` event type that triggers this (a large, deeply-nested per-interface
-counter blob emitted once every ~60s — 1,440 of them in one day of capture), consider calling it
-out by name in `suricata-analyst`'s SKILL.md/Sandbox Notes as a specific "never loop-print raw
-`stats` records" example, rather than relying on the general aggregation reminder alone.
+**Mitigation shipped**: The runtime guard described in #2 now spills this 24 MB return before it
+can enter model history, leaving a bounded preview and audited read handle. The existing prompt
+guidance to aggregate `stats` records remains defense in depth, but a noncompliant model can no
+longer reproduce this context-window failure through one oversized tool return.
 
 ## 7. Several Monty stdlib/builtin gaps beyond `__name__`/`sys.argv` cost real retries across nearly every session
 

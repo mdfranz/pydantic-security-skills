@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 import threading
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -102,6 +103,21 @@ class AuditLog:
         self._file.close()
 
 
+_OVERFLOW_METADATA_KEYS = (
+    "overflow_handle",
+    "overflow_bytes",
+    "overflow_content_handle",
+)
+
+
+def _overflow_metadata(part: object) -> dict[str, object]:
+    """Keep spill references in the audit without serializing unrelated tool metadata."""
+    metadata = getattr(part, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return {}
+    return {key: metadata[key] for key in _OVERFLOW_METADATA_KEYS if key in metadata}
+
+
 def make_event_stream_handler(audit: AuditLog, sink: "RunSink"):
     """Build an event_stream_handler that mirrors model responses and tool calls/results to
     the audit log incrementally, as pydantic_ai emits them during agent.run/run_sync -- not
@@ -139,7 +155,13 @@ def make_event_stream_handler(audit: AuditLog, sink: "RunSink"):
                 tool_name = getattr(part, "tool_name", None)
                 content = getattr(part, "content", None)
                 kind = "run_code_return" if tool_name == "run_code" else "tool_result"
-                audit.event(kind, tool_call_id=part.tool_call_id, tool_name=tool_name, content=content)
-                sink.emit(kind, tool_call_id=part.tool_call_id, tool_name=tool_name, content=content)
+                fields = {
+                    "tool_call_id": part.tool_call_id,
+                    "tool_name": tool_name,
+                    "content": content,
+                    **_overflow_metadata(part),
+                }
+                audit.event(kind, **fields)
+                sink.emit(kind, **fields)
 
     return handler

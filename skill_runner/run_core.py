@@ -10,6 +10,7 @@ from typing import Any, Protocol
 import yaml
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import Thinking
+from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.profiles.anthropic import ANTHROPIC_THINKING_BUDGET_MAP
 from pydantic_ai_harness import CodeMode, FileSystem
 from pydantic_ai_harness.memory import FileStore, Memory
@@ -17,6 +18,7 @@ from pydantic_monty import MountDir, OSAccess
 
 from .audit import AuditLog, install_sigterm_handler, restore_sigterm_handler
 from .config import RunOptions, load_model_catalog
+from .resilience import build_overflow_capability, build_provider_hooks
 from .script_lint import lint_and_fix_scripts
 
 SANDBOX_WORKSPACE_MOUNT = "/workspace"
@@ -239,7 +241,13 @@ def _build_instructions(skill_path: Path, *, interactive: bool) -> str:
     )
 
 
-def _build_agent(context: WorkspaceContext, options: RunOptions, instructions: str) -> Agent:
+def _build_agent(
+    context: WorkspaceContext,
+    options: RunOptions,
+    instructions: str,
+    audit: AuditLog,
+    sink: StatusSink,
+) -> Agent:
     capabilities: list[Any] = [
         FileSystem(root_dir=str(context.ws_path)),
         CodeMode(
@@ -252,6 +260,7 @@ def _build_agent(context: WorkspaceContext, options: RunOptions, instructions: s
             ],
             os_access=OSAccess(environ={}),
         ),
+        build_overflow_capability(context.logs_dir, context.task_id),
     ]
     if context.memory_enabled:
         capabilities.append(
@@ -271,6 +280,23 @@ def _build_agent(context: WorkspaceContext, options: RunOptions, instructions: s
         min_max_tokens = effort_budget + 4096
         if model_settings.get("max_tokens", 0) < min_max_tokens:
             model_settings["max_tokens"] = min_max_tokens
+
+    def on_rate_limit_retry(exc: ModelHTTPError, attempt: int, delay: float) -> None:
+        audit.event(
+            "model_request_retry",
+            reason="rate_limit",
+            status_code=exc.status_code,
+            model=exc.model_name,
+            retry_attempt=attempt,
+            max_retries=1,
+            delay_seconds=delay,
+        )
+        sink.status(
+            f"Provider rate limit from {exc.model_name}; retrying in {delay:g}s "
+            f"(attempt {attempt}/1)."
+        )
+
+    capabilities.append(build_provider_hooks(on_retry=on_rate_limit_retry))
 
     return Agent(
         options.model,
@@ -338,7 +364,7 @@ def prepare_run(
         )
         _configure_logfire(options, sink)
         instructions = _build_instructions(skill_path, interactive=options.interactive)
-        agent = _build_agent(context, options, instructions)
+        agent = _build_agent(context, options, instructions, audit, sink)
         lint_and_fix_scripts(context.ws_path, on_message=sink.status)
         prompt_prefix = _build_prompt_prefix(context, sink)
         run_metadata = {"task_id": context.task_id, "run_id": run_id}
