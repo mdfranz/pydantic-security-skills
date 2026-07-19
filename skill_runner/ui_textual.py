@@ -27,6 +27,7 @@ from .config import RunOptions, load_model_catalog
 from .run_core import (
     PROJECT_ROOT,
     RunSetup,
+    build_resume_hint,
     prepare_run,
 )
 from .session import RunSession
@@ -304,6 +305,12 @@ def run_textual(skill_dir: str, initial_prompt: str | None, options: RunOptions)
         raise
 
     with app.session:
-        app.run()
+        try:
+            app.run()
+        finally:
+            # Printed after app.run() returns, not through the TUI's own output log -- by this
+            # point Textual has already exited its alt-screen and restored the normal terminal,
+            # which is exactly when a copy-pasteable resume command becomes visible/useful.
+            print(f"\nTo resume this task: {build_resume_hint(skill_dir, setup.task_id, options, ui='textual')}")
         if app.interrupted_reason is not None:
             raise RunInterrupted(app.interrupted_reason)

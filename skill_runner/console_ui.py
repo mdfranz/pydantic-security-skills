@@ -6,7 +6,7 @@ import json
 from typing import Literal, NamedTuple
 
 from .config import RunOptions
-from .run_core import prepare_run
+from .run_core import build_resume_hint, prepare_run
 from .session import RunSession
 
 
@@ -88,39 +88,44 @@ def run_console(skill_dir: str, prompt: str, options: RunOptions) -> None:
     sink = ConsoleSink(debug=options.debug)
     setup = prepare_run(skill_dir, prompt, options, sink)
 
-    with RunSession(setup, sink, checkpoint_each_turn=False) as session:
-        print(f"Running Pydantic AI agent on skill: {setup.skill_name}")
-        result = session.submit_sync(prompt)
-        print("\n--- Agent Response ---")
-        print(result.output)
+    try:
+        with RunSession(setup, sink, checkpoint_each_turn=False) as session:
+            print(f"Running Pydantic AI agent on skill: {setup.skill_name}")
+            result = session.submit_sync(prompt)
+            print("\n--- Agent Response ---")
+            print(result.output)
 
-        # In interactive mode, handle checkpoints until user says stop
-        if options.interactive:
-            checkpoint_count = 1
-            while True:
-                print("\n" + "=" * 60)
-                user_input = input(
-                    f"\n[Checkpoint {checkpoint_count}] Continue, stop, or adjust focus? (continue/stop/focus on X): "
-                )
-                action = parse_checkpoint_input(user_input)
+            # In interactive mode, handle checkpoints until user says stop
+            if options.interactive:
+                checkpoint_count = 1
+                while True:
+                    print("\n" + "=" * 60)
+                    user_input = input(
+                        f"\n[Checkpoint {checkpoint_count}] Continue, stop, or adjust focus? (continue/stop/focus on X): "
+                    )
+                    action = parse_checkpoint_input(user_input)
 
-                if action.kind == "stop":
-                    print("Wrapping up analysis.")
-                    break
+                    if action.kind == "stop":
+                        print("Wrapping up analysis.")
+                        break
 
-                continuation_prompt = build_continuation_prompt(action)
+                    continuation_prompt = build_continuation_prompt(action)
 
-                if action.kind == "continue":
-                    print("Continuing analysis...\n")
-                elif action.kind == "focus":
-                    if continuation_prompt is None:
-                        print("Could not parse focus. Use 'continue', 'stop', or 'focus on <topic>'.")
-                        continue
-                    print(f"Pivoting to focus on: {action.focus}\n")
+                    if action.kind == "continue":
+                        print("Continuing analysis...\n")
+                    elif action.kind == "focus":
+                        if continuation_prompt is None:
+                            print("Could not parse focus. Use 'continue', 'stop', or 'focus on <topic>'.")
+                            continue
+                        print(f"Pivoting to focus on: {action.focus}\n")
 
-                result = session.submit_sync(continuation_prompt)
-                print(f"\n--- {'Analysis Continued' if action.kind == 'continue' else 'Focused Analysis'} ---")
-                print(result.output)
-                checkpoint_count += 1
+                    result = session.submit_sync(continuation_prompt)
+                    print(f"\n--- {'Analysis Continued' if action.kind == 'continue' else 'Focused Analysis'} ---")
+                    print(result.output)
+                    checkpoint_count += 1
 
-        session.complete()
+            session.complete()
+    finally:
+        # Printed regardless of outcome -- an interrupted or crashed run is exactly when
+        # resuming is most wanted, and the task workspace already exists by this point either way.
+        print(f"\nTo resume this task: {build_resume_hint(skill_dir, setup.task_id, options)}")

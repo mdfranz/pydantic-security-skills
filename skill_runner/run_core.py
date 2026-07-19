@@ -1,6 +1,7 @@
 """Run preparation: secure workspace resolution, prompt assembly, and agent construction."""
 
 import re
+import shlex
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -406,3 +407,16 @@ def prepare_run(
         prompt_prefix=prompt_prefix,
         options=options,
     )
+
+
+def build_resume_hint(skill_dir: str, task_id: str, options: RunOptions, *, ui: str | None = None) -> str:
+    """The copy-pasteable command that continues this exact task workspace later -- most useful
+    for --pristine, whose task-<uuid4> id is otherwise invisible outside workspace/logs/. Always
+    includes skill_dir/--workspace explicitly rather than omitting them when they match today's
+    defaults, so the printed command is correct regardless of the caller's cwd or this module's
+    own default constants. Deliberately omits --model/--thinking/--max-*/etc -- those are
+    per-invocation tuning choices, not part of the task's identity."""
+    parts = ["uv run skill-runner", shlex.quote(skill_dir), "--task", task_id, "--workspace", shlex.quote(str(options.workspace))]
+    if ui == "textual":
+        parts += ["--ui", "textual"]
+    return " ".join(parts)
