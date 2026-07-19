@@ -21,18 +21,21 @@ metadata:
 the runtime notes prepended to these instructions — see those before writing any code.)
 
 ### Step 1: Initial Discovery
-1.  **Find the input file**: Before writing any analysis code, call `list_directory(path='.')`
-    (the FileSystem tool, not `run_code`) to see what's actually in the workspace and use that
-    exact filename in subsequent `run_code` calls as `/workspace/<filename>`. The same call also
-    surfaces any existing `osqueryd_*.py` scripts — check for prior scripts and `analyst_log-*.md`
-    reports per "Reuse Before Rewrite" in the runtime notes before writing anything new.
+1.  **Find the input file**: The runner lists available input files (read-only, mounted at
+    `/data`) at the start of your prompt — use that exact filename as `/data/<filename>` in
+    `run_code`. The FileSystem tool's `list_directory` only sees the task workspace, not `/data`,
+    so it cannot be used to discover input files; if you need to re-confirm what's there, list it
+    from inside `run_code` with `pathlib.Path("/data").iterdir()`. Separately, call
+    `list_directory(path='.')` (the FileSystem tool) to check the task workspace itself for any
+    existing `osqueryd_*.py` scripts and `analyst_log-*.md` reports — per "Reuse Before Rewrite"
+    in the runtime notes — before writing anything new.
 2.  **Sample the Data**: Always begin by sampling the logs to understand the schema and volume.
     ```python
     import json
     import pathlib
 
     sampled = 0
-    f = pathlib.Path("/workspace/osqueryd.results.log").open()  # use the filename list_directory returned
+    f = pathlib.Path("/data/osqueryd.results.log").open()  # use the filename the runner listed in the prompt
     while True:
         line = f.readline()
         if not line:
@@ -51,7 +54,7 @@ the runtime notes prepended to these instructions — see those before writing a
     import pathlib
 
     query_names: dict[str, int] = {}
-    f = pathlib.Path("/workspace/osqueryd.results.log").open()  # use the filename list_directory returned
+    f = pathlib.Path("/data/osqueryd.results.log").open()  # use the filename the runner listed in the prompt
     while True:
         line = f.readline()
         if not line:
@@ -71,6 +74,8 @@ the runtime notes prepended to these instructions — see those before writing a
 1.  **Filter Noise**: Ignore expected system processes (e.g., standard `systemd` or idle system workers) and focus on anomalies or non-standard paths.
 2.  **Persist and Report**: Save reusable scripts under the `osqueryd_` prefix and document
     findings in your final answer, per "Saving Artifacts" in the runtime notes.
+3.  **Cache Derived Data**: For large logs (like `osqueryd.results.log`), avoid re-reading the entire file for every subsequent query or checkpoint. Write intermediate/derived results (such as a PID-to-process map, net processes index, or aggregated tables) to a JSON or JSONL file in `/workspace/` (e.g., `/workspace/osqueryd_process_map.json` or `/workspace/osqueryd_net_connections.jsonl`).
+4.  **Reuse Caches**: Before scanning the full log in a script, check if a relevant intermediate cache file already exists in `/workspace/` using `pathlib.Path("/workspace/cache_filename.json").exists()`. If it does, load the cached data to save time and reduce execution latency.
 
 ## Examples
 

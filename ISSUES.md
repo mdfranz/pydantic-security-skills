@@ -1,11 +1,13 @@
 # Known Issues / Improvement Backlog
 
-Findings from a review of `workspace/` transcripts (2026-07-17 osqueryd-analyst sessions) and
-Logfire traces for the `tomfoolery` project. Most items below are still open; #3 documents an
-issue that already has a mitigation shipped (see git history — message-history threading across
-interactive checkpoints; Monty sandbox gotchas documented in both skills' Sandbox Notes; a
-runtime lint/auto-fix pass in `runner.py`) but flags a deeper Monty-level question worth
-investigating separately.
+Findings from a review of `workspace/` transcripts (2026-07-17 osqueryd-analyst sessions; a
+2026-07-19 `--pristine`/`--logfire` suricata-analyst comparison across three models; and a
+project-wide scan of `workspace/logs/*.jsonl` and Logfire traces for the `tomfoolery` project).
+Most items below are still open; #3 documents an issue that already has a mitigation shipped (see
+git history — message-history threading across interactive checkpoints; Monty sandbox gotchas
+documented in both skills' Sandbox Notes; a runtime lint/auto-fix pass in
+`skill_runner/run_core.py`) but flags a deeper Monty-level question worth investigating
+separately.
 
 ## 1. osqueryd-analyst re-scans the full raw log for every new analysis angle
 
@@ -31,7 +33,7 @@ count table) is likely to be reused, and to check for/reuse that cache before re
 Given the file is ~1000x larger than suricata's `eve.json`, this is much higher-value for
 osqueryd-analyst than for suricata-analyst.
 
-## 2. Token-overflow risk for large osqueryd logs
+## 2. [Mitigated] Token-overflow risk for large osqueryd logs
 
 Earlier the same day (before the current Sandbox Notes existed), a suricata-analyst run hit:
 
@@ -44,12 +46,15 @@ caused by printing too much raw data into the model's own context instead of agg
 code. That failure hasn't recurred since (current sampling in both skills is capped at 5 lines
 for schema discovery), but osqueryd's input file is far larger than the eve.json that triggered
 it, and the process-lineage / shell-history dumps observed on 07-17 already print dozens of
-multi-line entries per call. There's no explicit guardrail against this in either skill.
+multi-line entries per call. At the time of the finding, there was no runtime guardrail against
+this in either skill.
 
-**Suggested fix**: Add an explicit reminder to both skills' "Python Style" / Working Agreements
-— aggregate and summarize in code, and only print bounded/paginated output (a top-N table, not
-full per-record dumps) — with a concrete cap (e.g. "print at most ~50 lines of detail per
-`run_code` call unless explicitly asked for a full listing").
+**Mitigation shipped**: The prompt-level ~50-line instruction remains useful guidance, but runtime
+enforcement no longer depends on model compliance. `OverflowingToolOutput` now intercepts every
+tool result at 10,000 characters, preserves the complete value under the owner-only,
+task-scoped `workspace/logs/overflow/<task>/` store, and puts only a bounded preview plus an opaque
+read handle into model history. If the spill fails, a 4,000-character truncation prevents the
+original result from entering context. The audit event records the handle and original byte count.
 
 ## 3. `if __name__ == "__main__":` kept recurring despite documentation — worth a Monty-side fix?
 
@@ -64,7 +69,7 @@ and `osqueryd_top_network_processes.py` too. So the doc-only fix did not reliabl
 model from writing the pattern; it only helped when the model hit the error directly and
 self-corrected within that same run.
 
-**Mitigation shipped**: `runner.py` now has `lint_and_fix_scripts()`, run at the start of every
+**Mitigation shipped**: `skill_runner/run_core.py` now has `lint_and_fix_scripts()`, run at the start of every
 invocation (before the "existing scripts" inventory is shown to the model) and again at the end
 (after the run's own artifacts are saved). It deterministically strips the `__main__` guard via
 regex + `textwrap.dedent` and warns (without auto-fixing, since the right replacement is
@@ -97,3 +102,294 @@ about Monty/the runner, not about the domain-specific log format) into a shared 
 (e.g. `skills/_shared/sandbox_notes.md`) that both `SKILL.md` files point to or embed via a
 build step, so it only needs to be updated once. Lower priority than #1/#2 — purely a
 maintainability concern, not something that has caused a failure yet.
+
+## 5. `run_code` retry-exhaustion crashes the whole run uncaught (observed with qwen3.6-flash)
+
+While running a `--pristine --logfire` comparison matrix (same suricata-analyst prompt against
+`eve-2026-01-06-01.json`, 3 models x 3 reps) to investigate issue-adjacent question "does
+`write_file` vs `run_code` usage vary by model?", `openrouter:qwen/qwen3.6-flash`'s rep-1 run
+crashed outright instead of finishing or degrading gracefully:
+
+```
+pydantic_ai.exceptions.UnexpectedModelBehavior: Tool 'run_code' exceeded max retries count of 3.
+Consider raising the retry limit, or see the docs on tool retries:
+https://ai.pydantic.dev/tools-advanced/#tool-retries
+```
+
+Root cause: the model kept emitting Monty-incompatible Python — `p.stat().st_size:,` (comma
+thousands-separator format specifier) and then `"...".format(...)` (`str.format()` isn't
+supported in Monty either) — across 3 consecutive `run_code` calls, exhausting pydantic_ai's
+per-tool retry cap. Gemini-3-flash-preview and GLM-5.2, run concurrently against the same
+prompt/data, both completed normally in the same window.
+
+Task: `task-37baec46-8e50-4f8c-bb9f-822d989e3d27`. Audit log:
+`workspace/logs/runner-task-37baec46-8e50-4f8c-bb9f-822d989e3d27-bd3a4c4ee93e43d1985f4faf4395a34f.jsonl`
+— shows the audit trail itself closed cleanly (`error` then `run_end` events written, per
+`RunSession.fail()`/`close()`), but the exception still propagates out of `run_console()`
+uncaught: `runner.py`'s `main()` only special-cases `TaskError` and `RunInterrupted` for exit-code
+mapping, so this exits 1 with a raw multi-frame traceback to the terminal instead of a clean
+message — and, unlike a SIGTERM/Ctrl+Q interruption, produces no partial `analyst_log-*.md` or
+`generated_code/` artifacts at all, since the crash happens before any turn ever reaches
+`_record_success`.
+
+**Suggested fix**: Catch `pydantic_ai.exceptions.UnexpectedModelBehavior` (and other
+non-`RunInterrupted` run-time exceptions) in `runner.py`'s `main()` alongside `TaskError`, print a
+short message instead of the full traceback, and exit non-zero without a stack dump — the audit
+log already has the detail. Separately, worth adding a Monty-format-specifier gotcha
+(`str.format()`, comma thousands-separators) to the Sandbox Notes shared with issue #4, since this
+is the same class of "idiomatic Python that silently doesn't exist in Monty" problem as the
+`__name__`/`sys.argv` cases in #3 — except here the model never self-corrected before running out
+of retries, where the `__name__` cases historically did.
+
+**Not a one-off**: a project-wide Logfire scan (`exception_type='pydantic_ai.exceptions.
+UnexpectedModelBehavior'`, all time) turns up this same crash from an earlier, unrelated
+`qwen/qwen3.6-flash` session (`workspace/logs/runner-default-14b76039162441d5b59d416eb3f70d98.jsonl`),
+also triggered by the same `f"...{x:,}"` comma-format-specifier syntax error, also exhausting
+3 retries without self-correcting. Two independent occurrences of the identical Monty gotcha
+defeating the same model is stronger grounds for raising `CodeMode`'s `max_retries` default (see
+the `--max-retries`/`--max-run-seconds` CLI discussion below) than a single incident would be.
+
+**Update**: `--max-retries` is now implemented (default raised from `CodeMode`'s built-in 3 to 5)
+— see issue #13. The `UnexpectedModelBehavior` clean-exit catch suggested above turned out to
+already exist in code, but only under `runner.py`'s `if __name__ == "__main__":` guard, which the
+real `skill-runner` entry point never runs through — see #13 for the full story. Only the
+`RunInterrupted` half of that gap is fixed so far; `UnexpectedModelBehavior` itself is still
+uncaught by `main()` and still exits with a raw traceback.
+
+## 6. [Mitigated] `qwen3.6-flash` dumps every Suricata `stats` event verbatim, blowing the context window
+
+During the same `--pristine` comparison matrix, `qwen3.6-flash`'s rep-3 run crashed with:
+
+```
+pydantic_ai.exceptions.ModelHTTPError: status_code: 400, ... This endpoint's maximum context
+length is 1000000 tokens. However, you requested about 6654694 tokens (6653059 of text input,
+1635 of tool input).
+```
+
+Cause: a single `run_code` call collected all 1,440 `event_type == "stats"` records into a list
+and printed each one with `json.dumps(s, indent=2)` in a loop — no sampling, no aggregation — and
+the resulting `run_code` return (24,738,153 chars) got fed straight back into the model's own
+context. Task: `task-c3acb612-c3e6-4c13-9994-ccd9e4373ffa`; audit log:
+`workspace/logs/runner-task-c3acb612-c3e6-4c13-9994-ccd9e4373ffa-b8b4f4efe7ca4aeaaa5e1c7f6b1d8d19.jsonl`.
+
+**Not a one-off, and not incidental to this test run**: a project-wide Logfire scan for
+`exception_type='pydantic_ai.exceptions.ModelHTTPError'` turns up the *identical* failure
+(23,702,777-char `stats`-dump return, same 6.6M-token overflow) from a completely separate,
+earlier `suricata-triage` session
+(`workspace/logs/runner-suricata-triage-be329e9fb3024c6c9168ccdd41f5623d.jsonl`) — the offending
+code in that run is a near-verbatim match: `stats_events = []`, append every `stats` record while
+scanning, then `for s in stats_events: print(json.dumps(s, indent=2))`. Two independent sessions,
+same model, same specific event type, same unbounded-dump pattern. This reads as a `qwen3.6-flash`-
+specific blind spot rather than random chance — Gemini-3-flash-preview and GLM-5.2, given the
+identical prompt/data in the same comparison matrix, never produced a `run_code` return anywhere
+near this size.
+
+This is issue #2 ("Token-overflow risk for large osqueryd logs") recurring on suricata-analyst,
+which issue #2 explicitly said "hasn't recurred since" — that was true only for the models tested
+at the time; it had not been fixed at the tool/skill level, just not re-triggered until this model
+was tried.
+
+**Mitigation shipped**: The runtime guard described in #2 now spills this 24 MB return before it
+can enter model history, leaving a bounded preview and audited read handle. The existing prompt
+guidance to aggregate `stats` records remains defense in depth, but a noncompliant model can no
+longer reproduce this context-window failure through one oversized tool return.
+
+## 7. Several Monty stdlib/builtin gaps beyond `__name__`/`sys.argv` cost real retries across nearly every session
+
+A project-wide scan of `pydantic_ai.exceptions.ToolRetryError` (72 occurrences total, all time)
+shows the `__name__`/`sys.argv` cases from issue #3 are just two entries in a longer list of
+"idiomatic Python that doesn't exist in Monty" mistakes models make and then have to
+self-correct out of, mid-run, at the cost of a retry each time:
+
+- **`collections` module is entirely absent** (`ModuleNotFoundError: No module named
+  'collections'`) — the single most common recoverable error in the whole history, 7 occurrences.
+  `Counter`/`defaultdict` are extremely idiomatic for the kind of tallying this skill does
+  constantly, so this gets hit often.
+- **`os` module is missing most of its usual surface** — `os.listdir`, `os.walk`, `os.path`,
+  `os.getcwd` all raise (5 occurrences combined, phrased inconsistently — see issue #8 below).
+- **`exec(...)` is not a callable at all** (`NameError: Unknown function: exec`, 3 occurrences) —
+  hit specifically when a model tries to reuse a saved script by reading its text and `exec`-ing
+  it, rather than pasting the text directly into a fresh `run_code` call.
+- **`socket`, `ipaddress` modules absent** (`ModuleNotFoundError`) — reasonable modules for network
+  log analysis to reach for.
+- **`str.format()` is not supported** (`AttributeError: 'str' object has no attribute 'format'`) —
+  also implicated in issue #5's qwen crash.
+
+None of this is documented today; each one is currently discovered the hard way, per-session, by
+whichever model happens to reach for it.
+
+**Suggested fix**: extend the shared Sandbox Notes (issue #4) with an explicit "what's in the
+Monty stdlib" allowlist/denylist — even a short one covering `collections`, the missing `os`
+functions, `socket`/`ipaddress`, and "no `exec`/`eval`" would likely eliminate most of these 72
+retries. This is a documentation gap, not a Monty behavior bug — the restrictions themselves may
+well be intentional sandbox design.
+
+## 8. File objects aren't iterable (`for line in f:`) — recurs despite the documented `readline()` pattern
+
+`TypeError: '_io.TextIOWrapper' object is not iterable` shows up 3 times across sessions, always
+from a model writing the natural `for line in f:` idiom instead of the explicit
+`while True: line = f.readline(); if not line: break` loop both skills' Step 2 sample code already
+demonstrates. Same shape of problem as issue #3's `__name__` guard — the documented-correct
+pattern is right there in the skill, but the model reaches for ordinary Python first and only
+self-corrects after hitting the error.
+
+**Suggested fix**: fold into whichever fix issue #3 lands on (deterministic lint/rewrite vs.
+clearer error vs. Monty-side change) rather than solving separately — it's the same category of
+"idiomatic Python landmine," just a different idiom.
+
+## 9. Two different failure *classes* for "unavailable in Monty," and one of them is actively misleading
+
+The `os`-module errors above don't all fail the same way. `os.listdir('.')` and `os.walk('.')` fail
+at what looks like a **static type-check pass** (a tool called `ty`), before the code ever runs:
+
+```
+error[unresolved-attribute]: Module `os` has no member `walk`
+ --> main.py:6:30
+info: Python 3.14 was assumed...
+```
+
+But `open(...)` and `FileNotFoundError` fail the *same* static-check way — `error[unresolved-
+reference]: Name 'open' used when not defined` / `'FileNotFoundError' used when not defined` —
+with a footer that reads like a confirmation the identifier *should* exist: `` `open` was added as
+a builtin in Python 3.0 ``. That phrasing actively suggests a version mismatch or a real bug,
+not "this sandbox doesn't have it," and — unlike a runtime `NameError` — it can't be caught with
+`try`/`except` since the code never starts executing. A model has no way to distinguish "you
+typo'd this" from "this is permanently unavailable here" from the message alone.
+
+This is the same ergonomics gap issue #3 already flagged for `__name__`/`sys.argv` (`"name
+'__name__' is not defined" reads like any other undefined-name typo"`), but one level worse: those
+were at least genuine `NameError`s from real execution; these are pre-execution rejections dressed
+up as ordinary Python facts.
+
+**Suggested fix**: same follow-up as issue #3 — worth a Monty-level pass to make "permanently
+unavailable in this sandbox" distinguishable from "genuinely undefined," particularly for the
+static-check-stage errors where the current phrasing points the model in exactly the wrong
+direction.
+
+## 10. `FileSystem` "path resolves outside the root directory" is the single most frequent error in the project's history — models keep reaching for `/data`, `/skill`, and `/workspace` through the wrong tool
+
+Across all `pydantic_ai.exceptions.ToolRetryError`/`ModelRetry` records, one family of message
+dominates: `Path {path!r} resolves outside the root directory` / `does not match any allowed
+pattern`, hit at least 11 times across variants — `'osqueryd.results.log'` (7x, all identical,
+the single most repeated exception message in the whole project), `'/data/eve-2026-01-06-01.json'`,
+`'/skill/references/eve_format.md'`, and `'/workspace'` (2x, one via `ModelRetry`).
+
+The `FileSystem` toolset (`read_file`/`write_file`/`list_directory`/etc.) is deliberately scoped to
+the task workspace only (`root_dir=ws_path` in `run_core.py:244`) — the `/data` (read-only input)
+and `/skill` (read-only reference) mounts are only reachable from *inside* `run_code`'s sandboxed
+`pathlib`, per `SANDBOX_DATA_MOUNT`/`SANDBOX_SKILL_MOUNT` in `run_core.py`. `suricata-analyst`'s
+own SKILL.md already says this explicitly ("The FileSystem tool's `list_directory` only sees the
+task workspace, not `/data`"), yet this is still the most-repeated error of any kind, meaning
+models keep trying it anyway, on both skills, across many sessions.
+
+The `'osqueryd.results.log'` case in particular deserves closer, source-level investigation before
+assuming the same root cause as the `/data`/`/skill`/`/workspace` cases: `_resolve_path` in
+`filesystem/_toolset.py` computes `self._root`/`self._real_root` via `.resolve()`/`os.path.
+realpath` at construction time, so a *bare relative filename* with no `/` or `..` shouldn't
+normally land outside root at all — the likeliest explanation is a symlink inside the workspace
+(e.g., a convenience link to the real `/data` file) that `os.path.realpath` correctly dereferences
+and then correctly rejects, but that hasn't been confirmed by reproduction, only inferred from the
+message pattern.
+
+**Suggested fix**: since this is already documented in SKILL.md and still recurs constantly, treat
+it like issue #3/#9 — the instruction alone isn't reliably preventing it. Consider having the
+`PermissionError` message itself name the right tool when the rejected path starts with a known
+sandbox mount prefix (e.g. "`/data` is only reachable from inside `run_code`, not this tool") so
+the model gets a corrective hint at the point of failure instead of only in the system prompt.
+
+## 11. `--model` accepts any string with no validation against `models.yaml`, so typos surface as opaque provider 404s
+
+`ModelCatalog.resolve()` (`config.py:88`) falls back to returning the input unchanged whenever it
+doesn't match a known alias or id — silent by design, so arbitrary `provider:model` strings
+(needed for models not yet in the catalog) keep working. But it means a plain typo gets no local
+feedback at all: `--model haiku-4.5` and `--model haiku-4-5` (the catalog's actual alias is
+`claude-haiku`, id `anthropic:claude-haiku-4-5`) both reached the provider and came back as a raw
+`404 not_found_error: model: haiku-4.5` from Anthropic, twice each, rather than a runner-level
+"not in models.yaml — did you mean 'claude-haiku'?" message.
+
+**Suggested fix**: in `resolve()`, when a `--model` value matches neither an alias/id nor looks
+like a plausible `provider:model` string (e.g. no `:` separator), have the CLI print the
+close/available aliases before making any request — cheap to add, and turns an opaque 400+ round
+trip into an immediate, actionable message.
+
+## 12. Network-level exceptions crash the run exactly like issue #5, and one produced a ~2-hour silent hang with no wall-clock safety net
+
+A second `--pristine`/`--logfire` OpenRouter comparison (deepseek-v4-pro, kimi-k3, minimax-m3 —
+same prompt/data/skill as the first) turned up a failure class distinct from anything in issues
+#5-#6: raw network/provider exceptions, uncaught, exactly like issue #5's `UnexpectedModelBehavior`
+crash. `kimi-k3` failed all 3 reps — 2 with `pydantic_ai.exceptions.ModelHTTPError: status_code:
+429 ... temporarily rate-limited upstream ... retry_after_seconds: 1`, one with a bare
+`httpx.ReadTimeout`. `minimax-m3` failed 2 of 3 reps: one with issue #5's own retry-exhaustion
+pattern, one with another `httpx.ReadTimeout`.
+
+**The `httpx.ReadTimeout` cases are the concerning part.** These aren't quick failures:
+
+- `kimi-k3` rep 1: audit log shows the last real activity (a `write_file` tool result) at
+  `15:37:40 UTC`; `ReadTimeout` didn't fire until `17:34:32 UTC` — a **silent ~1h57m stall** on
+  what should have been the next model response, for a total run duration of 7,737 seconds (~2h9m)
+  before producing anything. Task: `task-4605d7d6-cb46-4a0f-9be3-9dce905cacbc`.
+- `minimax-m3` rep 3: a shorter but still severe ~10-minute stall (`17:52:28` →`18:02:38`) after
+  what looked like a completed turn, for a 1,115s total run. Task:
+  `task-d39f5931-5975-4a83-8077-6aad10b55d5d`.
+
+Both ended with nothing to show for the wait — no partial report, no partial `generated_code/`
+snapshot beyond whatever the last successful turn had already checkpointed, and (same as issue #5)
+a raw multi-frame traceback to the terminal rather than a clean error.
+
+This is the single strongest piece of evidence yet for the `--max-run-seconds` wall-clock-budget
+CLI flag discussed alongside issues #5/#6 (see `results/pristine-model-comparison-2026-07-19.md`'s
+duration section, where GLM-5.2 was slow-but-making-progress at 500-800s) — a 2-hour dead stall
+producing zero output is a fundamentally worse failure than "thorough but slow," and neither
+`CodeMode.max_retries` nor `UsageLimits.request_limit` would catch it, since nothing ever gets far
+enough to retry or spend another turn.
+
+Separately, the two `429` cases are notable because the provider's own response explicitly said
+`retry_after_seconds: 1` — a signal that a 1-second backoff-and-retry would very likely have
+succeeded — yet the run failed immediately rather than retrying. Worth checking whether
+`pydantic_ai`'s OpenRouter provider (or the underlying OpenAI-compatible client it wraps) has any
+built-in retry-on-429 behavior at all, since none was observed here.
+
+**Suggested fix**: same `runner.py::main()` catch-and-clean-exit fix as issue #5, broadened to
+network-layer exceptions (`httpx.ReadTimeout`, `pydantic_ai.exceptions.ModelHTTPError`), not just
+`UnexpectedModelBehavior`. Independently, the `--max-run-seconds` wall-clock cap from the
+`--max-retries`/`--max-turns` CLI discussion would bound the damage from a hang like kimi-k3's
+regardless of cause. And consider a single top-level retry (with the provider's own
+`retry_after_seconds` as the delay) for 429 responses specifically, before giving up.
+
+**Update**: `--max-retries`, `--max-run-seconds`, and `--max-turns` are now implemented (see issue
+#13) — `--max-run-seconds` directly bounds a hang like kimi-k3's regardless of cause. The
+`UnexpectedModelBehavior`/`ModelHTTPError`/`ReadTimeout` clean-exit catch from issue #5's suggested
+fix (broadened here to network exceptions) is still open — only the `RunInterrupted` half of that
+fix shipped as part of #13, since it was a hard blocker for `--max-run-seconds` itself.
+
+## 13. `RunInterrupted`'s exit-143 mapping never actually ran via the real `skill-runner` entry point — Ctrl+C/SIGTERM crashed with a raw traceback all along
+
+Discovered while validating `--max-run-seconds` (issue #12's fix, below): a run interrupted by the
+new watchdog exited with a raw multi-frame traceback and exit code 1, not the clean "exit 143, no
+traceback" behavior `audit.py`'s `RunInterrupted`/`map_run_interrupted_exit_code()` are explicitly
+designed to produce (see that module's own docstrings, and `refs/textual-ui-plan.md`'s "top-level
+`RunInterrupted` → exit `143` mapping").
+
+Root cause: `runner.py`'s `main()` only ever caught `TaskError`. The `except RunInterrupted:
+map_run_interrupted_exit_code()` mapping existed, but only under `if __name__ == "__main__":` at
+the bottom of the file — which runs when `runner.py` is executed directly (`python
+skill_runner/runner.py`), but **not** when invoked through the installed console-script entry
+point, `pyproject.toml`'s `skill-runner = "skill_runner.runner:main"`. That entry point's
+auto-generated shim (`.venv/bin/skill-runner`) does `from skill_runner.runner import main;
+sys.exit(main())` directly — it never touches the `__main__` guard, so the mapping silently never
+ran. Confirmed via the actual crash traceback: `File ".../bin/skill-runner", line 10, in <module>
+sys.exit(main())`.
+
+Since `skill-runner`/`uv run skill-runner` (not `python skill_runner/runner.py`) is how this tool
+is actually invoked everywhere in this repo (`README.md`, `compare_models.sh`, every test run in
+`results/*.md`), **this means real Ctrl+C and SIGTERM have crashed with a raw traceback and exit
+code 1 instead of a clean exit 143 for as long as the console-script entry point has existed** —
+this issue's own earlier entries (#5, #12) mischaracterized `main()` as already catching
+`RunInterrupted` when suggesting it be "broadened"; it was never catching it at all.
+
+**Mitigation shipped**: moved the `except RunInterrupted: map_run_interrupted_exit_code()` clause
+into `main()` itself (`runner.py`), alongside the existing `except TaskError`, so it runs
+regardless of entry point. The `if __name__ == "__main__":` block is now a trivial `main()` call.
+Verified end-to-end: `--max-run-seconds 5` against a real model now exits `143` with no traceback,
+and the audit log shows a clean `interrupted` → `run_end status=failed` sequence instead of an
+`error` event.

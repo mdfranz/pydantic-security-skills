@@ -1,7 +1,7 @@
 # The Pydantic Stack in This Solution
 
 This document explains how each piece of the Pydantic AI ecosystem is wired together in
-`runner.py` to run the `suricata-analyst` skill (and any future skill) safely against
+the `skill_runner` package to run the `suricata-analyst` skill (and any future skill) safely against
 untrusted, potentially huge log data. It's an implementation-level companion to `README.md`,
 which covers usage; this covers *why the code is built the way it is*.
 
@@ -16,7 +16,7 @@ which covers usage; this covers *why the code is built the way it is*.
 | `pyyaml` | 6.0.3 | Parses `skill.yaml` (structured skill config, if present) |
 
 None of these are used in isolation — the interesting part is how `Agent`, `CodeMode`, and
-`Monty` compose in `runner.py:93-106`.
+`Monty` compose in `skill_runner/run_core.py`.
 
 ---
 
@@ -35,13 +35,13 @@ agent = Agent(
 - the model connection (`args.model`, a `provider:model-id` string resolved by pydantic-ai's
   model registry — no separate client setup needed),
 - the **system prompt**, which is literally the skill's `SKILL.md` file read verbatim
-  (`load_skill()`, `runner.py:35-47`) — the skill *is* the prompt, there's no templating layer,
-- the **tool-calling loop** — `agent.run_sync(run_prompt)` (`runner.py:121`) drives however many
+  (`load_skill()`, `skill_runner/run_core.py`) — the skill *is* the prompt, there's no templating layer,
+- the **tool-calling loop** — `agent.run_sync(run_prompt)` (`skill_runner/run_core.py`) drives however many
   model⇄tool round trips are needed until the model produces a final answer,
 - **`model_settings`**, a generic passthrough for provider-level request parameters (`max_tokens`,
   `temperature`, etc.), applied to every call for the life of the agent. This project only ever
   populates one key in it, `max_tokens`, and only when `--max-tokens` and/or `--thinking` is
-  passed (`runner.py:260-273`, see §2).
+  passed (`skill_runner/run_core.py`, see §2).
 
 `capabilities` is pydantic-ai's extension point for bolting cross-cutting behavior onto an
 agent (tool wrapping, filesystem access, deferred-tool handling, reasoning effort, etc.) without
@@ -77,7 +77,7 @@ Anthropic's API specifically rejects any request where `max_tokens` isn't strict
 `thinking.budget_tokens` — the model can't be given fewer output tokens than it's allowed to
 spend on reasoning alone. `ANTHROPIC_THINKING_BUDGET_MAP` (imported from
 `pydantic_ai.profiles.anthropic`) is the same lookup table pydantic-ai's own Anthropic model
-class uses internally to translate an `effort` level into `budget_tokens`; `runner.py` reuses it
+class uses internally to translate an `effort` level into `budget_tokens`; `skill_runner/run_core.py` reuses it
 directly (rather than hand-maintaining a duplicate) so the two can't drift apart, and computes a
 floor of `budget_tokens + 4096` for `model_settings["max_tokens"]`. An explicit `--max-tokens`
 value is only left alone if it already clears that floor — an insufficient explicit value gets
