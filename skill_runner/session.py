@@ -58,6 +58,11 @@ class RunSession:
             self.fail(exc)
         elif self.state is SessionState.ACTIVE:
             self.complete()
+        elif self.state is SessionState.RUNNING:
+            # A UI can be closed while its worker is awaiting the provider. Do not silently
+            # finalize that in-flight turn as a generic failed run: preserve the explicit
+            # interruption event and keep the most recent successful checkpoint intact.
+            self.interrupt("session closed while a turn was running")
         self.close()
         return False
 

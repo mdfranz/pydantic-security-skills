@@ -30,7 +30,7 @@ from .run_core import (
     build_resume_hint,
     prepare_run,
 )
-from .session import RunSession
+from .session import RunSession, SessionState
 from .tui_widgets import FileViewerScreen, QuitConfirmScreen, ToolTable
 
 _CELL_TEXT_LIMIT = 300
@@ -258,12 +258,28 @@ class AnalystApp(App):
         if isinstance(self.screen, QuitConfirmScreen):
             return
         if await self.push_screen_wait(QuitConfirmScreen()):
+            self._cancel_active_turn("user requested quit")
             self.exit()
+
+    def _cancel_active_turn(self, reason: str) -> None:
+        """Record and cancel the sole agent worker before leaving the app.
+
+        Textual exits its UI immediately, but an agent turn is an independent worker. Marking
+        the session first makes the audit truthful even if cancellation reaches the provider at
+        a later await point; cancelling the group prevents a worker from completing against a
+        closed session after the alternate screen has been restored.
+        """
+        if not self.turn_active:
+            return
+        self.session.interrupt(reason)
+        self.workers.cancel_group(self, "agent-run")
 
     def _handle_sigterm(self) -> None:
         reason = "received signal SIGTERM"
         self.interrupted_reason = reason
-        self.session.interrupt(reason)
+        self._cancel_active_turn(reason)
+        if self.session.state is not SessionState.INTERRUPTED:
+            self.session.interrupt(reason)
         self.exit()
 
     @work(exclusive=True, group="agent-run")
@@ -284,6 +300,12 @@ class AnalystApp(App):
             # returns so the top-level exit-143 mapping still applies.
             self.interrupted_reason = str(e)
             self.exit()
+        except asyncio.CancelledError:
+            # Normal during a confirmed quit or app shutdown. The explicit transition keeps
+            # `RunSession.__exit__` from closing a RUNNING turn without an interruption event.
+            if self.session.state is not SessionState.INTERRUPTED:
+                self.session.interrupt("agent turn cancelled")
+            raise
         except Exception as e:
             self.sink.status(f"Error: {e}")
         finally:

@@ -63,7 +63,8 @@ flowchart TB
 ### Runner (`skill_runner` package)
 
 `skill_runner/runner.py` is the thin CLI entrypoint behind `skill-runner`: argparse (including the
-shared `[skill_dir] prompt` positional grammar and `--ui`), the Textual optional-dependency guard,
+shared `[skill_dir] prompt` positional grammar, explicit `--skill` selection for blank Textual
+sessions, and `--ui`), the Textual optional-dependency guard,
 and dispatch to one of two UI drivers. The application code behind it is divided by lifecycle:
 
 - **`config.py`** converts argparse into immutable `RunOptions` and normalizes either supported
@@ -102,6 +103,8 @@ differently:
   text/thinking, a live `DirectoryTree` of the task workspace, and a bottom `Input` bar that
   always accepts free-text follow-ups). Drives the agent with `await agent.run(...)` inside a
   Textual `@work` coroutine, on the App's own asyncio loop — never `run_sync`, never a thread.
+  A confirmed quit marks and cancels an active agent worker before the session closes, preserving
+  an interruption event and the last successful checkpoint.
   Reusable tables and modal screens live in `skill_runner/tui_widgets.py`; the entire Textual
   surface is imported lazily, only when `--ui textual` is selected, so a console-only install
   never imports `textual`.

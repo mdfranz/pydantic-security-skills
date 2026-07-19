@@ -648,3 +648,19 @@ limit without replaying an agent run.
 **Result:** Issues #2/#6 no longer rely on prompt compliance to protect model context, and a
 transient OpenRouter/Kimi rate limit gets one bounded retry at the failed request boundary rather
 than requiring a monkeypatch or replaying completed tool calls.
+
+---
+
+### Phase 17: Textual Shutdown and Empty-Session Skill Selection (2026-07-19)
+
+**Objective:** Close two Textual UI lifecycle/CLI gaps found in PR review.
+
+- A confirmed Textual quit now records an interruption and cancels the active `agent-run` worker
+  before leaving the app. `RunSession` also treats any otherwise-unresolved `RUNNING` state at
+  context exit as an interruption, retaining the last successful checkpoint rather than silently
+  closing an in-flight turn.
+- Added `--skill <dir>` so `uv run skill-runner --ui textual --skill skills/osqueryd-analyst`
+  opens a blank session for a non-default skill. The existing positional CLI remains compatible.
+
+**Result:** Textual shutdown has an explicit session transition, and non-default skills no longer
+need a placeholder prompt to open an empty TUI session.

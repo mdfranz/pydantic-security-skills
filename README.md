@@ -101,6 +101,9 @@ uv run skill-runner skills/suricata-analyst "Baseline analysis" --ui textual
 # The prompt itself is optional only with --ui textual -- an empty session opens and the
 # first message is typed into the bottom bar. Console mode always requires a prompt.
 uv run skill-runner --ui textual
+
+# Use --skill to open an empty Textual session for a non-default skill:
+uv run skill-runner --ui textual --skill skills/osqueryd-analyst
 ```
 
 Flags:
@@ -109,6 +112,8 @@ Flags:
   scripts and quick one-shot runs. `textual` opens a multi-panel TUI (tool calls, model
   output/thinking, a live artifacts tree, and a bottom bar that always accepts free-text
   follow-up prompts) for interactive investigation sessions — see "TUI mode" below.
+- `--skill` — explicitly select a skill directory. This is useful with `--ui textual` when
+  opening an empty session for a non-default skill.
 - `--workspace` — the workspace base/case root (default `./workspace`); see "Task-scoped workspaces" above.
 - `--task` — reuse (or create) a named task workspace; accumulates across runs.
 - `--pristine` — start a fresh, isolated task workspace with no prior agent state.

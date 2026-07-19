@@ -28,6 +28,13 @@ def build_parser() -> argparse.ArgumentParser:
         "the bottom bar); console mode always requires one.",
     )
     parser.add_argument(
+        "--skill",
+        dest="explicit_skill_dir",
+        default=None,
+        help="Explicit skill directory. In particular, use with --ui textual to open an empty "
+        "session for a non-default skill without supplying a prompt.",
+    )
+    parser.add_argument(
         "--ui",
         default="console",
         choices=["console", "textual"],
@@ -110,11 +117,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def resolve_positionals(
-    positionals: list[str], ui: str, parser: argparse.ArgumentParser
+    positionals: list[str], ui: str, parser: argparse.ArgumentParser, explicit_skill_dir: str | None = None
 ) -> tuple[str, str | None]:
     """Resolve the shared [skill_dir] prompt positional grammar. A single optional
     positional would be ambiguous with argparse (it can't tell a lone skill_dir from a lone
     prompt), so both stay one positional list, resolved explicitly here instead."""
+    if explicit_skill_dir is not None:
+        if len(positionals) == 0:
+            if ui != "textual":
+                parser.error("prompt is required unless --ui textual is used with no arguments")
+            return explicit_skill_dir, None
+        if len(positionals) == 1:
+            return explicit_skill_dir, positionals[0]
+        parser.error("--skill accepts at most one positional prompt")
+
     if len(positionals) == 0:
         if ui != "textual":
             parser.error("prompt is required unless --ui textual is used with no arguments")
@@ -131,7 +147,9 @@ def main():
     args = parser.parse_args()
     options = RunOptions.from_namespace(args)
 
-    skill_dir, initial_prompt = resolve_positionals(args.positionals, args.ui, parser)
+    skill_dir, initial_prompt = resolve_positionals(
+        args.positionals, args.ui, parser, args.explicit_skill_dir
+    )
 
     # Before any workspace/task directory is created, since --pristine has side effects.
     if args.ui == "textual" and importlib.util.find_spec("textual") is None:

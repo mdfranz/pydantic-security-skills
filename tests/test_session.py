@@ -107,6 +107,21 @@ class RunSessionTests(unittest.TestCase):
             self.assertEqual(session.state, SessionState.FAILED)
             self.assertEqual(audit.events[-1], ("run_end", {"status": "failed"}))
 
+    def test_closing_an_inflight_session_records_interruption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            audit = FakeAudit()
+            setup = self.make_setup(Path(directory), FakeAgent(["unused"]), audit)
+
+            with RunSession(setup, FakeSink(), checkpoint_each_turn=True) as session:
+                session._begin_turn("first")
+
+            self.assertEqual(session.state, SessionState.INTERRUPTED)
+            self.assertIn(
+                ("interrupted", {"reason": "session closed while a turn was running"}),
+                audit.events,
+            )
+            self.assertEqual(audit.events[-1], ("run_end", {"status": "failed"}))
+
     def test_max_run_seconds_interrupts_a_stuck_turn(self):
         previous = install_sigterm_handler()
         try:

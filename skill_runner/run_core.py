@@ -380,6 +380,7 @@ def prepare_run(
             interactive=options.interactive,
             thinking=options.thinking,
             max_tokens=options.max_tokens,
+            max_turns=options.max_turns,
             memory_enabled=context.memory_enabled,
             memory_scope=context.memory_scope,
         )
