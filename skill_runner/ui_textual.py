@@ -140,6 +140,23 @@ class ToolTable(DataTable):
     def on_resize(self, event: events.Resize) -> None:
         self._resize_columns()
 
+    def add_row(self, *cells, **kwargs):
+        row_key = super().add_row(*cells, **kwargs)
+        # Real terminals can report an initial placeholder size (e.g. an SSH session before
+        # the true geometry is negotiated) before the first authoritative Resize event lands
+        # -- headless tests never hit this since run_test(size=...) reports the final size
+        # immediately. Re-syncing on every row keeps Result from getting stuck narrow until
+        # some *unrelated* later resize happens to fix it. Deferred via call_after_refresh
+        # rather than called inline, so it runs after DataTable's own add_row bookkeeping has
+        # finished settling instead of layering another synchronous layout pass on top of it.
+        self.call_after_refresh(self._resize_columns)
+        return row_key
+
+    def update_cell(self, *args, **kwargs):
+        result = super().update_cell(*args, **kwargs)
+        self.call_after_refresh(self._resize_columns)
+        return result
+
     def _resize_columns(self) -> None:
         if not self.columns:
             return

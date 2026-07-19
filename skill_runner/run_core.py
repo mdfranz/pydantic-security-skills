@@ -42,7 +42,12 @@ TASK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 RESERVED_TASK_NAMES = {"default", "data", "logs", "memory"}
 DEFAULT_TASK_ID = "default"
 
-SANDBOX_NOTES_PATH = Path(__file__).parent / "prompts" / "sandbox_notes.md"
+# skill_runner/ is a package one level below the project root -- models.yaml and prompts/
+# deliberately live at the root (config/content, not code), so both paths below need to
+# climb out of the package directory, not just use __file__'s own parent.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+SANDBOX_NOTES_PATH = PROJECT_ROOT / "prompts" / "sandbox_notes.md"
 
 
 class TaskError(Exception):
@@ -118,7 +123,7 @@ def create_pristine_task_root(base: Path, *, max_attempts: int = 5) -> tuple[str
 
 def load_models_config() -> dict:
     """Load models configuration from models.yaml if it exists."""
-    config_path = Path(__file__).parent / "models.yaml"
+    config_path = PROJECT_ROOT / "models.yaml"
     if config_path.exists():
         try:
             with open(config_path, "r", encoding="utf-8") as f:
