@@ -515,3 +515,31 @@ runner implementation into an importable package.
 
 **Result:** The repository root now contains shell scripts, Markdown, project configuration, and
 content directories only; the Python runner is a packaged application.
+
+---
+
+### Phase 14: Session-Oriented Runner Refactor (2026-07-19)
+
+**Objective:** Reduce orchestration complexity left after the package split, make run lifecycle
+ownership explicit, and prevent the console and Textual drivers from drifting apart.
+
+**Work:**
+- Added immutable `RunOptions` and a normalized `ModelCatalog` in `skill_runner/config.py`,
+  removing `argparse.Namespace` mutation and the duplicate hierarchical/flat model traversals.
+- Reduced `skill_runner/run_core.py` to secure workspace preparation, prompt/capability assembly,
+  agent construction, and a narrow `RunSetup` handoff. Setup failures after audit creation now
+  record `setup_error`/failed `run_end`, close the log, and restore the prior SIGTERM handler.
+- Added `RunSession` as the application boundary shared by both UIs. It owns first-turn inventory
+  prefixing, sync/async submission, message history, structured turns, checkpoint policy, script
+  cleanup, artifact persistence, failure/interruption state, audit finalization, and signal-handler
+  restoration.
+- Moved report rendering and generated-code persistence into `skill_runner/artifacts.py` around
+  valid-by-construction `Turn` and `Transcript` models.
+- Split reusable Textual tables and modal screens into `skill_runner/tui_widgets.py`, leaving
+  `ui_textual.py` focused on event rendering and application interaction.
+- Added focused unit coverage for model normalization, multi-turn report rendering, prompt-prefix
+  behavior, successful and failed session finalization, and post-audit setup failures.
+
+**Result:** The UI drivers now collect input and render output while one session layer enforces
+run behavior. `run_core.py` fell from 674 to 381 lines and `ui_textual.py` from 561 to 309 lines,
+with audit cleanup defined for both setup-time and turn-time failures.

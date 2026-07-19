@@ -2,13 +2,12 @@
 a blocking input()-based checkpoint loop under --interactive. "Dumb and primitive" by
 design; this is what scripts and quick one-shot runs use."""
 
-import argparse
 import json
 from typing import Literal, NamedTuple
 
-from .audit import RunInterrupted, make_event_stream_handler
-from .run_core import ArtifactSession, prepare_run, run_turn_sync, write_artifacts
-from .script_lint import lint_and_fix_scripts
+from .config import RunOptions
+from .run_core import prepare_run
+from .session import RunSession
 
 
 def _echo(label: str, content: str, debug: bool, limit: int = 400) -> None:
@@ -83,35 +82,20 @@ def build_continuation_prompt(action: CheckpointAction) -> str | None:
     return None
 
 
-def run_console(skill_dir: str, prompt: str, args: argparse.Namespace) -> None:
+def run_console(skill_dir: str, prompt: str, options: RunOptions) -> None:
     """Today's console behavior, preserved byte-for-byte: agent.run_sync, a blocking
     input() checkpoint loop under --interactive, and the same artifact/report shape."""
-    sink = ConsoleSink(debug=args.debug)
-    setup = prepare_run(skill_dir, prompt, args, sink, ui_mode="console")
-    stream_handler = make_event_stream_handler(setup.audit, sink)
+    sink = ConsoleSink(debug=options.debug)
+    setup = prepare_run(skill_dir, prompt, options, sink)
 
-    completed = False
-    run_prompt = setup.prompt_prefix + setup.initial_prompt
-
-    try:
+    with RunSession(setup, sink, checkpoint_each_turn=False) as session:
         print(f"Running Pydantic AI agent on skill: {setup.skill_name}")
-        result = run_turn_sync(
-            setup.agent,
-            run_prompt,
-            None,
-            stream_handler=stream_handler,
-            run_metadata=setup.run_metadata,
-            audit=setup.audit,
-        )
+        result = session.submit_sync(prompt)
         print("\n--- Agent Response ---")
         print(result.output)
 
-        # Collect all outputs for analyst_log (especially important in interactive mode)
-        all_prompts = [run_prompt]
-        all_outputs = [result.output]
-
         # In interactive mode, handle checkpoints until user says stop
-        if args.interactive:
+        if options.interactive:
             checkpoint_count = 1
             while True:
                 print("\n" + "=" * 60)
@@ -134,49 +118,9 @@ def run_console(skill_dir: str, prompt: str, args: argparse.Namespace) -> None:
                         continue
                     print(f"Pivoting to focus on: {action.focus}\n")
 
-                result = run_turn_sync(
-                    setup.agent,
-                    continuation_prompt,
-                    result.all_messages(),
-                    stream_handler=stream_handler,
-                    run_metadata=setup.run_metadata,
-                    audit=setup.audit,
-                )
+                result = session.submit_sync(continuation_prompt)
                 print(f"\n--- {'Analysis Continued' if action.kind == 'continue' else 'Focused Analysis'} ---")
                 print(result.output)
-                all_prompts.append(continuation_prompt)
-                all_outputs.append(result.output)
                 checkpoint_count += 1
 
-        # Save the full conversation and findings independently of the audit log
-        session = ArtifactSession(
-            initial_prompt=setup.initial_prompt,
-            prompts=all_prompts,
-            outputs=all_outputs,
-            message_history=result.all_messages(),
-            interactive=args.interactive,
-        )
-        write_artifacts(
-            ws_path=setup.ws_path,
-            run_stamp=setup.run_stamp,
-            skill_name=setup.skill_name,
-            session=session,
-            debug=args.debug,
-            on_message=sink.status,
-        )
-
-        # Fix up any scripts saved this run before the process exits, so a same-run reuse
-        # later in this session (or the next session's inventory) never sees a broken guard.
-        lint_and_fix_scripts(setup.ws_path, on_message=sink.status)
-
-        completed = True
-
-    except RunInterrupted as e:
-        setup.audit.event("interrupted", reason=str(e))
-        raise
-    except Exception as e:
-        setup.audit.event("error", error=str(e), error_type=type(e).__name__)
-        raise
-    finally:
-        setup.audit.event("run_end", status="completed" if completed else "failed")
-        setup.audit.close()
+        session.complete()

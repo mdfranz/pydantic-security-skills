@@ -28,10 +28,12 @@ flowchart TB
         Logs[("Audit log (host-only)\nworkspace/logs/")]
         MemStore[("Memory notebook\nworkspace/memory/<skill>/<task>/")]
         Monty["Monty sandbox"]
+        Session["RunSession\nturn state + transcript + lifecycle"]
         Sink["RunSink\nConsoleSink or TextualSink"]
         Artifacts["Artifacts:\nanalyst_log-*.md\ngenerated_code/*.py"]
 
         Skill -- "instructions" --> Agent
+        Session -- "submit_sync / submit_async" --> Agent
         Agent --> FS
         Agent --> CM
         Agent -.-> Think
@@ -43,9 +45,10 @@ flowchart TB
         Monty -- "mount /data (ro)" --> Data
         Monty -- "mount /skill (ro)" --> Skill
         Agent -- "event_stream_handler:\nmodel text/thinking, tool calls/results" --> Sink
-        Sink -- "write_artifacts()" --> Artifacts
+        Session -- "checkpoint / complete" --> Artifacts
         Artifacts -.-> TaskWs
-        Agent -. "run_start/prompt/tool/error/run_end events\n(host writes directly, never agent-visible)" .-> Logs
+        Agent -. "streamed model/tool events" .-> Logs
+        Session -. "run_start/prompt/error/run_end" .-> Logs
     end
 
     Agent -. "optional" .-> Logfire["Logfire (traces, task_id/run_id metadata)"]
@@ -53,28 +56,25 @@ flowchart TB
 
 ### Runner (`skill_runner` package)
 
-`skill_runner/runner.py` is the thin CLI entrypoint behind `skill-runner`: argparse (including the shared
-`[skill_dir] prompt` positional grammar and the `--ui` flag), the `--ui textual`
-optional-dependency guard, and dispatch to one of two UI drivers. Everything that used to be
-one large `main()` moved into `skill_runner/run_core.py`, which both drivers depend on and which has five
-responsibilities, and nothing else:
+`skill_runner/runner.py` is the thin CLI entrypoint behind `skill-runner`: argparse (including the
+shared `[skill_dir] prompt` positional grammar and `--ui`), the Textual optional-dependency guard,
+and dispatch to one of two UI drivers. The application code behind it is divided by lifecycle:
 
-1. **Resolves the task** for this run — a named `--task` (accumulate), an auto-generated
-   `--pristine` id, or the shared `default` — and derives the task-scoped workspace root from it.
-   See "Task-scoped workspaces" below.
-2. **Assembles** a skill's instructions + shared runtime notes into one system prompt, and wires
-   up the agent's capabilities.
-3. **Drives** the agent loop through shared per-turn helpers (`run_turn_sync`/`run_turn_async`),
-   each of which records the audit `prompt` event immediately before calling the agent.
-4. **Persists** everything the run produced — audit log, generated code, final report — as
-   plain files (`write_artifacts`), independent of whether the model chose to save anything
-   itself.
-5. **Maintains** the task workspace between runs: linting previously-saved scripts for sandbox
-   incompatibilities, and telling the agent what already exists there (and what input files are
-   available) before it starts.
+- **`config.py`** converts argparse into immutable `RunOptions` and normalizes either supported
+  `models.yaml` shape into one `ModelCatalog`.
+- **`run_core.py`** prepares the secure workspace, skill prompt, capabilities, agent, inventory
+  prefix, and narrow `RunSetup` handoff. If setup fails after audit creation it writes a failed
+  `run_end`, closes the audit, and restores the previous SIGTERM handler before re-raising.
+- **`session.py`** owns the agent loop, first-turn prompt prefix, transcript, state transitions,
+  post-turn lint/artifact policy, errors and interruptions, and final audit closure. UI drivers
+  submit prompts but do not mutate the workspace or manage run lifecycle themselves.
+- **`artifacts.py`** owns the structured `Turn`/`Transcript` model, pure report rendering, and
+  durable report/generated-code writes.
+- **`audit.py`** owns the append-only log and translates streamed pydantic-ai events into the
+  shared sink/audit vocabulary.
 
-Neither `skill_runner/run_core.py` nor the runner contains any analysis logic itself — it never parses a log
-file or knows what a "suspicious SNI" is. All domain knowledge lives in skills.
+None of these modules contains analysis logic or knows what a "suspicious SNI" is. All domain
+knowledge lives in skills.
 
 #### Two UI backends, one `RunSink` contract
 
@@ -90,17 +90,16 @@ differently:
   text/thinking, a live `DirectoryTree` of the task workspace, and a bottom `Input` bar that
   always accepts free-text follow-ups). Drives the agent with `await agent.run(...)` inside a
   Textual `@work` coroutine, on the App's own asyncio loop — never `run_sync`, never a thread.
-  Imported lazily, only when `--ui textual` is selected, so a console-only install never imports
-  `textual`.
+  Reusable tables and modal screens live in `skill_runner/tui_widgets.py`; the entire Textual
+  surface is imported lazily, only when `--ui textual` is selected, so a console-only install
+  never imports `textual`.
 
 Both sinks implement the same `RunSink` protocol (`status(message)` for one-off lines,
-`emit(kind, **fields)` for the same event vocabulary `AuditLog.event` persists), constructed by
-`make_event_stream_handler(audit, sink)` in `skill_runner/audit.py`, which calls both `audit.event(...)` and
-`sink.emit(...)` with identical `(kind, fields)` for every event — the sink always sees exactly
-what the audit log persists. A multi-turn Textual session checkpoints the same
-`analyst_log-<run_stamp>.md` after every successful turn (via the shared `ArtifactSession` /
-`write_artifacts`), listing every submitted prompt rather than claiming the latest follow-up was
-the sole original one; a failed or interrupted turn leaves the prior checkpoint intact.
+`emit(kind, **fields)` for the same event vocabulary `AuditLog.event` persists). `RunSession`
+constructs `make_event_stream_handler(audit, sink)`, so every streamed event reaches both audit
+and UI with identical fields. A multi-turn Textual session checkpoints the same
+`analyst_log-<run_stamp>.md` after every successful turn from its structured `Transcript`; a
+failed or interrupted turn leaves the prior checkpoint intact.
 
 SIGTERM handling differs by necessity between the two: console mode relies on `skill_runner/audit.py`'s raw
 `signal.signal(SIGTERM, ...)` handler, which raises straight through the blocking `run_sync`

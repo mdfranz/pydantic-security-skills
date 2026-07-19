@@ -7,15 +7,15 @@ import argparse
 import importlib.util
 
 from .audit import RunInterrupted, map_run_interrupted_exit_code
+from .config import RunOptions, load_model_catalog
 from .console_ui import run_console
-from .run_core import TASK_ID_RE, TaskError, load_models_config
+from .run_core import PROJECT_ROOT, TASK_ID_RE, TaskError
 
 DEFAULT_SKILL_DIR = "skills/suricata-analyst"
 
 
 def build_parser() -> argparse.ArgumentParser:
-    models_config = load_models_config()
-    default_model = models_config.get("default_model", "google:gemini-3-flash-preview")
+    default_model = load_model_catalog(PROJECT_ROOT).default_model
 
     parser = argparse.ArgumentParser(description="Pydantic AI Security Skill Runner")
     parser.add_argument(
@@ -106,6 +106,7 @@ def resolve_positionals(
 def main():
     parser = build_parser()
     args = parser.parse_args()
+    options = RunOptions.from_namespace(args)
 
     skill_dir, initial_prompt = resolve_positionals(args.positionals, args.ui, parser)
 
@@ -117,9 +118,9 @@ def main():
         if args.ui == "textual":
             from .ui_textual import run_textual
 
-            run_textual(skill_dir, initial_prompt, args)
+            run_textual(skill_dir, initial_prompt, options)
         else:
-            run_console(skill_dir, initial_prompt, args)
+            run_console(skill_dir, initial_prompt, options)
     except TaskError as e:
         parser.error(str(e))
 

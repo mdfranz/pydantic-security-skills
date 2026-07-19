@@ -6,7 +6,7 @@ import signal
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pydantic_ai.messages import (
     FunctionToolCallEvent,
@@ -32,12 +32,19 @@ def _raise_on_sigterm(signum, frame):
     raise RunInterrupted(f"received signal {signum}")
 
 
-def install_sigterm_handler() -> None:
+def install_sigterm_handler() -> Any:
     """Converts SIGTERM into a normal Python exception so the finally block in the caller
     still runs and writes run_end -- without this, a hard kill (e.g. a process manager's
     timeout, as opposed to Ctrl+C's KeyboardInterrupt, which Python already turns into an
     exception) terminates before the audit log is closed out."""
+    previous_handler = signal.getsignal(signal.SIGTERM)
     signal.signal(signal.SIGTERM, _raise_on_sigterm)
+    return previous_handler
+
+
+def restore_sigterm_handler(previous_handler: Any) -> None:
+    """Restore the handler that was active before this run took ownership of SIGTERM."""
+    signal.signal(signal.SIGTERM, previous_handler)
 
 
 def map_run_interrupted_exit_code() -> None:
