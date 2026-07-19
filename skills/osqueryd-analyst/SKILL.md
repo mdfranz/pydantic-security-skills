@@ -74,6 +74,8 @@ the runtime notes prepended to these instructions — see those before writing a
 1.  **Filter Noise**: Ignore expected system processes (e.g., standard `systemd` or idle system workers) and focus on anomalies or non-standard paths.
 2.  **Persist and Report**: Save reusable scripts under the `osqueryd_` prefix and document
     findings in your final answer, per "Saving Artifacts" in the runtime notes.
+3.  **Cache Derived Data**: For large logs (like `osqueryd.results.log`), avoid re-reading the entire file for every subsequent query or checkpoint. Write intermediate/derived results (such as a PID-to-process map, net processes index, or aggregated tables) to a JSON or JSONL file in `/workspace/` (e.g., `/workspace/osqueryd_process_map.json` or `/workspace/osqueryd_net_connections.jsonl`).
+4.  **Reuse Caches**: Before scanning the full log in a script, check if a relevant intermediate cache file already exists in `/workspace/` using `pathlib.Path("/workspace/cache_filename.json").exists()`. If it does, load the cached data to save time and reduce execution latency.
 
 ## Examples
 

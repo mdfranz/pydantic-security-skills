@@ -84,6 +84,12 @@ A few other stdlib/builtin gaps that are easy to reach for out of habit and will
   input_value=3478, input_type=int]`. Always `str()` the key when building a dict you intend to
   return or print as JSON: `results[str(dest_port)] = ...`.
 
+## Python Style & Working Agreements
+
+To ensure stability, efficiency, and to prevent token limits from being exceeded, adhere to the following coding rules:
+- **Avoid Token Overflow**: Printing full records or raw dumps of large files directly into the execution output can exceed context token limits. Always aggregate, filter, and summarize data programmatically in your Python code first.
+- **Output Limits**: Limit printed detail (such as individual log lines, event details, or lists of records) to at most ~50 lines of detail per `run_code` call, unless the user explicitly requests a full listing. If more data exists, print a summary (e.g., total count, top 10 elements) instead.
+
 ## Running a Saved Script
 
 Monty has no `exec`/`eval` and no way to `import` a file saved in `/workspace` — sandbox
