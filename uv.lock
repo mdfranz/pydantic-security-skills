@@ -1265,7 +1265,7 @@ wheels = [
 [[package]]
 name = "pydantic-security-skills"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "logfire", extra = ["system-metrics"] },
     { name = "pydantic-ai" },

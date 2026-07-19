@@ -11,3 +11,7 @@ Keep the following up to date if they exist and there should be minimum overlap
 - PROJECT.md - chronology of commits and development phases
 
 Only update if they exist.
+
+# Markdown Coventions
+- Use relative links
+- Never use `file:///`

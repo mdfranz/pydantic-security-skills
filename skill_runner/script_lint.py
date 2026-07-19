@@ -1,4 +1,4 @@
-"""Deterministic cleanup for workspace scripts saved across runs (see runner.py's
+"""Deterministic cleanup for workspace scripts saved across runs (see run_core.py's
 sandbox-notes docstring for why this exists instead of relying on model compliance)."""
 
 import re

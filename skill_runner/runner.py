@@ -6,9 +6,9 @@ ui_textual.py (the two UI drivers)."""
 import argparse
 import importlib.util
 
-from audit import RunInterrupted, map_run_interrupted_exit_code
-from console_ui import run_console
-from run_core import TASK_ID_RE, TaskError, load_models_config
+from .audit import RunInterrupted, map_run_interrupted_exit_code
+from .console_ui import run_console
+from .run_core import TASK_ID_RE, TaskError, load_models_config
 
 DEFAULT_SKILL_DIR = "skills/suricata-analyst"
 
@@ -115,7 +115,7 @@ def main():
 
     try:
         if args.ui == "textual":
-            from ui_textual import run_textual
+            from .ui_textual import run_textual
 
             run_textual(skill_dir, initial_prompt, args)
         else:

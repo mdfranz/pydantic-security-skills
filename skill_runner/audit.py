@@ -17,7 +17,7 @@ from pydantic_ai.messages import (
 )
 
 if TYPE_CHECKING:
-    from run_core import RunSink
+    from .run_core import RunSink
 
 
 class RunInterrupted(BaseException):

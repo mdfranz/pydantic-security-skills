@@ -21,7 +21,7 @@ threats, suspicious egress, protocol anomalies).
 
 ## How it works
 
-- `runner.py` loads a skill's `SKILL.md` as the agent's instructions.
+- `skill-runner` loads a skill's `SKILL.md` as the agent's instructions.
 - `--workspace` (default `./workspace`) is the **case root**, not the agent's own directory. It
   has four subtrees: `data/` (canonical input evidence, read-only), one directory per *task*
   (the agent's writable workspace — see below), `memory/` (per-task notebook, tool-visible only —
@@ -77,20 +77,20 @@ export GEMINI_API_KEY="your-gemini-api-key"
 ./run.sh google:gemini-3.5-flash skills/osqueryd-analyst
 
 # Run raw command: skill_dir defaults to skills/suricata-analyst; task defaults to "default"
-uv run runner.py "Identify the top 5 source IPs by event count in eve.json"
+uv run skill-runner "Identify the top 5 source IPs by event count in eve.json"
 
 # Or target a different skill / task / model explicitly:
-uv run runner.py skills/suricata-analyst "Analyze security events" --task suricata-triage --model google:gemini-3-flash-preview
+uv run skill-runner skills/suricata-analyst "Analyze security events" --task suricata-triage --model google:gemini-3-flash-preview
 
 # Or start from a clean workspace, isolated from any prior run:
-uv run runner.py skills/suricata-analyst "Baseline analysis" --pristine
+uv run skill-runner skills/suricata-analyst "Baseline analysis" --pristine
 
 # Or open the Textual TUI instead of the plain console (requires the `tui` extra, see below):
-uv run runner.py skills/suricata-analyst "Baseline analysis" --ui textual
+uv run skill-runner skills/suricata-analyst "Baseline analysis" --ui textual
 
 # The prompt itself is optional only with --ui textual -- an empty session opens and the
 # first message is typed into the bottom bar. Console mode always requires a prompt.
-uv run runner.py --ui textual
+uv run skill-runner --ui textual
 ```
 
 Flags:
@@ -158,7 +158,7 @@ Add a directory under `skills/<name>/` with a `SKILL.md` (and optionally `skill.
 structured config, plus a `references/` directory). Run it with:
 
 ```bash
-uv run runner.py skills/<name> "<prompt>"
+uv run skill-runner skills/<name> "<prompt>"
 ```
 
 ## Comparing models
@@ -172,7 +172,7 @@ MODELS="google:gemini-3-flash-preview openrouter:deepseek/deepseek-v4-pro" \
   scripts/compare_models.sh "Generate traffic statistics: breakdown of protocols and top talkers."
 ```
 
-Any arguments after the prompt are passed through to `runner.py` (e.g. `--thinking medium`).
+Any arguments after the prompt are passed through to `skill-runner` (e.g. `--thinking medium`).
 Optional env vars: `SKILL_DIR` (default `skills/suricata-analyst`) and `WORKSPACE` (default
 `./workspace`). One model's failure doesn't abort the others — a summary table at the end maps
 each model to its pristine task id and status, so you can find each run's `analyst_log-*.md`

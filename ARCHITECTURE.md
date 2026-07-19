@@ -7,7 +7,7 @@ history of how it got this way (see `PROJECT.md`).
 
 ## System in one sentence
 
-A single long-lived host process (`runner.py`) drives an LLM agent whose instructions come
+A single long-lived host process (`skill_runner/runner.py`) drives an LLM agent whose instructions come
 entirely from a **skill** directory, gives it two independent ways to touch the world — native
 filesystem tools and a sandboxed code-execution tool — and writes everything the agent produces
 back out as durable, human-readable artifacts.
@@ -16,7 +16,7 @@ back out as durable, human-readable artifacts.
 
 ```mermaid
 flowchart TB
-    subgraph Host["Host process (runner.py + run_core.py)"]
+    subgraph Host["Host process (skill_runner package)"]
         Skill["Skill directory\nSKILL.md + skill.yaml + references/*.md"]
         Agent["Agent (pydantic-ai)"]
         FS["FileSystem capability"]
@@ -28,7 +28,7 @@ flowchart TB
         Logs[("Audit log (host-only)\nworkspace/logs/")]
         MemStore[("Memory notebook\nworkspace/memory/<skill>/<task>/")]
         Monty["Monty sandbox"]
-        Sink["RunSink\nConsoleSink (console_ui.py) or\nTextualSink (ui_textual.py)"]
+        Sink["RunSink\nConsoleSink or TextualSink"]
         Artifacts["Artifacts:\nanalyst_log-*.md\ngenerated_code/*.py"]
 
         Skill -- "instructions" --> Agent
@@ -51,12 +51,12 @@ flowchart TB
     Agent -. "optional" .-> Logfire["Logfire (traces, task_id/run_id metadata)"]
 ```
 
-### Runner (`runner.py` + `run_core.py` + UI drivers)
+### Runner (`skill_runner` package)
 
-`runner.py` itself is a thin CLI entrypoint now: argparse (including the shared
+`skill_runner/runner.py` is the thin CLI entrypoint behind `skill-runner`: argparse (including the shared
 `[skill_dir] prompt` positional grammar and the `--ui` flag), the `--ui textual`
 optional-dependency guard, and dispatch to one of two UI drivers. Everything that used to be
-one large `main()` moved into `run_core.py`, which both drivers depend on and which has five
+one large `main()` moved into `skill_runner/run_core.py`, which both drivers depend on and which has five
 responsibilities, and nothing else:
 
 1. **Resolves the task** for this run — a named `--task` (accumulate), an auto-generated
@@ -73,7 +73,7 @@ responsibilities, and nothing else:
    incompatibilities, and telling the agent what already exists there (and what input files are
    available) before it starts.
 
-Neither `run_core.py` nor the runner contains any analysis logic itself — it never parses a log
+Neither `skill_runner/run_core.py` nor the runner contains any analysis logic itself — it never parses a log
 file or knows what a "suspicious SNI" is. All domain knowledge lives in skills.
 
 #### Two UI backends, one `RunSink` contract
@@ -82,10 +82,10 @@ file or knows what a "suspicious SNI" is. All domain knowledge lives in skills.
 neither produces different artifacts or a different event vocabulary, they just render it
 differently:
 
-- **`console_ui.py`** (`ConsoleSink`, `run_console`) — today's behavior: raw `print()`s to a flat
+- **`skill_runner/console_ui.py`** (`ConsoleSink`, `run_console`) — today's behavior: raw `print()`s to a flat
   terminal, plus a blocking `input()` checkpoint loop under `--interactive`. Still calls
   `agent.run_sync` synchronously; nothing here is async.
-- **`ui_textual.py`** (`TextualSink`, `AnalystApp`, `run_textual`) — a multi-panel TUI (a
+- **`skill_runner/ui_textual.py`** (`TextualSink`, `AnalystApp`, `run_textual`) — a multi-panel TUI (a
   `DataTable` pairing tool calls with their results by `tool_call_id`, a `RichLog` for model
   text/thinking, a live `DirectoryTree` of the task workspace, and a bottom `Input` bar that
   always accepts free-text follow-ups). Drives the agent with `await agent.run(...)` inside a
@@ -95,14 +95,14 @@ differently:
 
 Both sinks implement the same `RunSink` protocol (`status(message)` for one-off lines,
 `emit(kind, **fields)` for the same event vocabulary `AuditLog.event` persists), constructed by
-`make_event_stream_handler(audit, sink)` in `audit.py`, which calls both `audit.event(...)` and
+`make_event_stream_handler(audit, sink)` in `skill_runner/audit.py`, which calls both `audit.event(...)` and
 `sink.emit(...)` with identical `(kind, fields)` for every event — the sink always sees exactly
 what the audit log persists. A multi-turn Textual session checkpoints the same
 `analyst_log-<run_stamp>.md` after every successful turn (via the shared `ArtifactSession` /
 `write_artifacts`), listing every submitted prompt rather than claiming the latest follow-up was
 the sole original one; a failed or interrupted turn leaves the prior checkpoint intact.
 
-SIGTERM handling differs by necessity between the two: console mode relies on `audit.py`'s raw
+SIGTERM handling differs by necessity between the two: console mode relies on `skill_runner/audit.py`'s raw
 `signal.signal(SIGTERM, ...)` handler, which raises straight through the blocking `run_sync`
 call. Under Textual, that same raw handler can instead land inside asyncio's own internals
 (observed during testing landing mid-`select()`) rather than inside the running turn's
@@ -238,7 +238,7 @@ Two hardening details address the "Retention and permissions" open item in
 - **SIGTERM.** A `Ctrl+C` (`KeyboardInterrupt`) already unwinds through Python's normal
   `finally`, so `run_end` gets written. A hard `SIGTERM` (e.g. a process manager's timeout, not a
   user's interactive interrupt) previously did not — Python installs no default handler for it,
-  so the process died before the audit log closed. `runner.py` now converts `SIGTERM` into a
+  so the process died before the audit log closed. The runner now converts `SIGTERM` into a
   catchable `RunInterrupted` exception, which the `finally` block treats the same way, and exits
   `143` (the standard `128 + SIGTERM` code) to signal the process was terminated. `SIGKILL`
   remains uncatchable by any process — an OS-level limit, not something this addresses.

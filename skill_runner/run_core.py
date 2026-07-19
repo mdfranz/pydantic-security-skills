@@ -29,8 +29,8 @@ from pydantic_ai_harness import CodeMode, FileSystem
 from pydantic_ai_harness.memory import FileStore, Memory
 from pydantic_monty import MountDir, OSAccess
 
-from audit import AuditLog, install_sigterm_handler
-from script_lint import lint_and_fix_scripts
+from .audit import AuditLog, install_sigterm_handler
+from .script_lint import lint_and_fix_scripts
 
 SANDBOX_WORKSPACE_MOUNT = "/workspace"
 SANDBOX_SKILL_MOUNT = "/skill"
@@ -147,6 +147,51 @@ def resolve_model(model_name: str, models_config: dict) -> str:
             if m.get("alias") == model_name or m.get("id") == model_name:
                 return m.get("id")
     return model_name
+
+
+@dataclass
+class ModelChoice:
+    """One selectable entry in models.yaml, flattened out of whichever of the two supported
+    shapes (hierarchical `providers`, or a flat `models` list) resolve_model() was given."""
+
+    id: str
+    alias: str
+    description: str
+    provider: str
+
+
+def list_model_choices(models_config: dict) -> list[ModelChoice]:
+    """Flatten models.yaml into a UI-agnostic list -- used by ui_textual.py's model picker.
+    Mirrors resolve_model()'s two supported shapes (hierarchical providers, flat fallback)."""
+    choices: list[ModelChoice] = []
+    providers = models_config.get("providers")
+    if isinstance(providers, dict):
+        for provider_name, provider_info in providers.items():
+            if not isinstance(provider_info, dict):
+                continue
+            for m in provider_info.get("models", []):
+                model_id = m.get("id", "")
+                choices.append(
+                    ModelChoice(
+                        id=model_id,
+                        alias=m.get("alias", model_id),
+                        description=m.get("description", ""),
+                        provider=provider_name,
+                    )
+                )
+        return choices
+
+    for m in models_config.get("models", []):
+        model_id = m.get("id", "")
+        choices.append(
+            ModelChoice(
+                id=model_id,
+                alias=m.get("alias", model_id),
+                description=m.get("description", ""),
+                provider=model_id.split(":", 1)[0] if ":" in model_id else "",
+            )
+        )
+    return choices
 
 
 def load_sandbox_notes() -> str:
@@ -331,13 +376,19 @@ async def run_turn_async(
     stream_handler,
     run_metadata: dict,
     audit: AuditLog,
+    model: str | None = None,
 ):
     """Shared async per-turn helper -- Textual's worker awaits this directly on the App's
-    own asyncio loop. Always records the audit `prompt` event immediately before the call."""
+    own asyncio loop. Always records the audit `prompt` event immediately before the call.
+    `model`, if given, overrides the Agent's own default model for just this call --
+    pydantic_ai supports switching models turn-to-turn without rebuilding the Agent, which is
+    what ui_textual.py's command-palette model picker relies on."""
     record_prompt(audit, prompt)
     kwargs = {"event_stream_handler": stream_handler, "metadata": run_metadata}
     if message_history is not None:
         kwargs["message_history"] = message_history
+    if model is not None:
+        kwargs["model"] = model
     return await agent.run(prompt, **kwargs)
 
 

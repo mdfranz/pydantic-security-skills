@@ -423,8 +423,8 @@ capability doesn't exist for those runs at all, not just an empty one.
 **Objective:** Refactor model configuration file to group models under hierarchical providers instead of maintaining a flat list, and update resolving logic accordingly.
 
 **Work:**
-- Refactored [models.yaml](file:///home/mdfranz/github/pydantic-security-skills/models.yaml) to group models by their provider (`google`, `openai`, `anthropic`, `openrouter`) in a hierarchical structure under the `providers` key.
-- Updated `resolve_model` in [runner.py](file:///home/mdfranz/github/pydantic-security-skills/runner.py) to parse the new hierarchical format while retaining a backward-compatible fallback to the legacy flat `models` list format.
+- Refactored [models.yaml](models.yaml) to group models by their provider (`google`, `openai`, `anthropic`, `openrouter`) in a hierarchical structure under the `providers` key.
+- Updated `resolve_model` in [runner.py](skill_runner/runner.py) to parse the new hierarchical format while retaining a backward-compatible fallback to the legacy flat `models` list format.
 
 **Result:** Cleaner models configuration taxonomy and more robust model resolution.
 
@@ -497,3 +497,21 @@ event vocabulary between the two.
   correct distinction between native `read_file` and relative `pathlib` access when reusing a
   saved workspace script. This applies to every skill because `prompts/sandbox_notes.md` is
   prepended to each skill prompt.
+
+---
+
+### Phase 13: Package the Runner (2026-07-19)
+
+**Objective:** Keep shell wrappers and Markdown at the repository root while moving all Python
+runner implementation into an importable package.
+
+- Moved the CLI, shared run behavior, audit logging, script linting, and both UI drivers into
+  `skill_runner/`; package-local imports make the runtime independent of root-level Python
+  modules.
+- Added the `skill-runner` console command through `pyproject.toml`, backed by Hatchling, so
+  users invoke `uv run skill-runner …` rather than executing a source file directly.
+- Kept `run.sh` and `compare_models.sh` at the root and updated them, operational docs, and the
+  workspace-lifecycle examples to use the installed command.
+
+**Result:** The repository root now contains shell scripts, Markdown, project configuration, and
+content directories only; the Python runner is a packaged application.

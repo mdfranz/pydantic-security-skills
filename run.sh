@@ -47,4 +47,4 @@ if [ -z "${prompt:-}" ]; then
 fi
 
 # Run the runner in interactive mode using uv, passing any additional arguments along
-uv run runner.py "$SKILL_DIR" "$prompt" --model "$MODEL" --interactive "$@"
+uv run skill-runner "$SKILL_DIR" "$prompt" --model "$MODEL" --interactive "$@"

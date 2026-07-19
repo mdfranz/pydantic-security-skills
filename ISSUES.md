@@ -4,7 +4,7 @@ Findings from a review of `workspace/` transcripts (2026-07-17 osqueryd-analyst 
 Logfire traces for the `tomfoolery` project. Most items below are still open; #3 documents an
 issue that already has a mitigation shipped (see git history — message-history threading across
 interactive checkpoints; Monty sandbox gotchas documented in both skills' Sandbox Notes; a
-runtime lint/auto-fix pass in `runner.py`) but flags a deeper Monty-level question worth
+runtime lint/auto-fix pass in `skill_runner/run_core.py`) but flags a deeper Monty-level question worth
 investigating separately.
 
 ## 1. osqueryd-analyst re-scans the full raw log for every new analysis angle
@@ -64,7 +64,7 @@ and `osqueryd_top_network_processes.py` too. So the doc-only fix did not reliabl
 model from writing the pattern; it only helped when the model hit the error directly and
 self-corrected within that same run.
 
-**Mitigation shipped**: `runner.py` now has `lint_and_fix_scripts()`, run at the start of every
+**Mitigation shipped**: `skill_runner/run_core.py` now has `lint_and_fix_scripts()`, run at the start of every
 invocation (before the "existing scripts" inventory is shown to the model) and again at the end
 (after the run's own artifacts are saved). It deterministically strips the `__main__` guard via
 regex + `textwrap.dedent` and warns (without auto-fixing, since the right replacement is

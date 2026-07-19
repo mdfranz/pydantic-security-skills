@@ -214,7 +214,7 @@ unique `run_id`. Only paths created or changed by each run are shown.
 ### 1. No flags → `default` task (accumulate)
 
 ```
-$ python runner.py "analyze eve.json"
+$ uv run skill-runner "analyze eve.json"
 ```
 ```
 workspace/
@@ -236,7 +236,7 @@ workspace/
 ### 2. Same command later → accumulates in place
 
 ```
-$ python runner.py "now check for beacons"
+$ uv run skill-runner "now check for beacons"
 ```
 ```
 workspace/
@@ -264,7 +264,7 @@ of requiring the agent to go read `analyst_log-25-07-18_14-02-11.md` itself.
 ### 3. `--task suricata-triage` → named, reusable (isolated from `default`)
 
 ```
-$ python runner.py --task suricata-triage "triage today's alerts"
+$ uv run skill-runner --task suricata-triage "triage today's alerts"
 ```
 ```
 workspace/
@@ -283,7 +283,7 @@ Rerun with `--task suricata-triage` and it accumulates into this same folder.
 ### 4. `--pristine` → fresh task workspace, no prior agent state
 
 ```
-$ python runner.py --pristine "baseline test run"
+$ uv run skill-runner --pristine "baseline test run"
 ```
 ```
 workspace/
@@ -311,7 +311,7 @@ created the directory never had the capability attached to write one.
 ### 5. Custom base
 
 ```
-$ python runner.py --task ir-case-42 --workspace /cases/ws "..."
+$ uv run skill-runner --task ir-case-42 --workspace /cases/ws "..."
 ```
 ```
 /cases/ws/
@@ -327,13 +327,13 @@ $ python runner.py --task ir-case-42 --workspace /cases/ws "..."
 ### 6. Error / reserved cases
 
 ```
-$ python runner.py --task foo --pristine "..."
+$ uv run skill-runner --task foo --pristine "..."
 error: --task and --pristine are mutually exclusive
 
-$ python runner.py --task logs "..."
+$ uv run skill-runner --task logs "..."
 error: 'logs' is a reserved task name
 
-$ python runner.py --task foo/../logs "..."
+$ uv run skill-runner --task foo/../logs "..."
 error: task names must match [a-z0-9][a-z0-9_-]{0,63}
 ```
 
@@ -342,7 +342,7 @@ read canonical evidence only through `/data`, and never reach `workspace/logs/` 
 
 ## Runner changes
 
-Scoped to `runner.py`, the shared sandbox notes, and skill instructions that describe input
+Scoped to the `skill_runner` package, the shared sandbox notes, and skill instructions that describe input
 discovery. No change to Monty's execution model is required.
 
 - **New args:** `--task NAME` (default none), `--pristine` (flag). `--workspace` stays but

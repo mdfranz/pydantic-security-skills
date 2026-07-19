@@ -8,17 +8,27 @@ import argparse
 import asyncio
 import signal
 from datetime import datetime
+from functools import partial
 
 from rich.text import Text
 from textual import events, work
 from textual.app import App, ComposeResult
+from textual.command import Hit, Hits, Provider
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, DirectoryTree, Footer, Header, Input, Label, RichLog
 
-from audit import RunInterrupted, make_event_stream_handler
-from run_core import ArtifactSession, RunSetup, prepare_run, run_turn_async, write_artifacts
-from script_lint import lint_and_fix_scripts
+from .audit import RunInterrupted, make_event_stream_handler
+from .run_core import (
+    ArtifactSession,
+    RunSetup,
+    list_model_choices,
+    load_models_config,
+    prepare_run,
+    run_turn_async,
+    write_artifacts,
+)
+from .script_lint import lint_and_fix_scripts
 
 _CELL_TEXT_LIMIT = 300
 
@@ -188,9 +198,37 @@ class QuitConfirmScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class ModelCommands(Provider):
+    """Command-palette source listing every model in models.yaml. Ctrl+P already opens the
+    palette (see the Footer's own '^p palette' hint) so this reuses that existing, always-
+    visible affordance rather than adding another keybinding or a permanent widget."""
+
+    def _label(self, app: "AnalystApp", choice) -> str:
+        current = " [current]" if choice.id == app.current_model else ""
+        return f"{choice.alias} -- {choice.description} ({choice.provider}){current}"
+
+    async def discover(self) -> Hits:
+        app = self.app
+        assert isinstance(app, AnalystApp)
+        for choice in app.available_models:
+            yield Hit(1.0, self._label(app, choice), partial(app.set_model, choice.id), help=choice.id)
+
+    async def search(self, query: str) -> Hits:
+        app = self.app
+        assert isinstance(app, AnalystApp)
+        matcher = self.matcher(query)
+        for choice in app.available_models:
+            label = self._label(app, choice)
+            score = matcher.match(label)
+            if score > 0:
+                yield Hit(score, matcher.highlight(label), partial(app.set_model, choice.id), help=choice.id)
+
+
 class AnalystApp(App):
     """Multiple panels (tool calls, model output, artifacts) plus a bottom bar for
     prompting/follow-ups, for interactive investigation sessions."""
+
+    COMMANDS = App.COMMANDS | {ModelCommands}
 
     CSS = """
     #output {
@@ -214,8 +252,10 @@ class AnalystApp(App):
 
     def __init__(self, setup: RunSetup, buffered_messages: list[str]):
         super().__init__()
-        self.title = f"{setup.skill_name} -- {setup.task_id} -- {setup.model}"
         self.setup = setup
+        self.current_model = setup.model
+        self.available_models = list_model_choices(load_models_config())
+        self.title = f"{setup.skill_name} -- {setup.task_id} -- {self.current_model}"
         self.buffered_messages = buffered_messages
         self.sink = TextualSink(self)
         self.stream_handler = make_event_stream_handler(setup.audit, self.sink)
@@ -277,6 +317,17 @@ class AnalystApp(App):
     def request_artifacts_reload(self) -> None:
         self.artifacts_tree.reload()
 
+    def set_model(self, model_id: str) -> None:
+        """Called from the command palette (Ctrl+P -> pick a model from models.yaml). Takes
+        effect on the next submitted prompt -- pydantic_ai lets a turn override the Agent's
+        model without rebuilding it, so message_history carries over across the switch."""
+        if model_id == self.current_model:
+            return
+        self.current_model = model_id
+        self.title = f"{self.setup.skill_name} -- {self.setup.task_id} -- {self.current_model}"
+        self.setup.audit.event("model_changed", model=model_id)
+        self.sink.status(f"Model switched to {model_id} (takes effect on the next prompt).")
+
     @work
     async def action_quit(self) -> None:
         # Overrides App's default action_quit (bound to Ctrl+Q), which exits immediately --
@@ -310,6 +361,7 @@ class AnalystApp(App):
                 stream_handler=self.stream_handler,
                 run_metadata=self.setup.run_metadata,
                 audit=self.setup.audit,
+                model=self.current_model,
             )
             self.message_history = result.all_messages()
             self.session.prompts.append(full_prompt)

@@ -6,7 +6,7 @@ This document reviews how the **Pydantic AI Security Skills Runner** utilizes **
 
 ## 1. Current Architecture Overview
 
-In [runner.py](file:///home/mdfranz/github/nuevo-pydantic/pydantic-security-skills/runner.py), the `Agent` is initialized with two capabilities:
+In [runner.py](../skill_runner/runner.py), the `Agent` is initialized with two capabilities:
 1. `FileSystem(root_dir=str(ws_path))`
 2. `CodeMode(...)` with workspace mounting:
    ```python
@@ -28,7 +28,7 @@ Under this configuration:
 
 ### 🚀 Optimization 1: Selective Tool Sandboxing (Excluding FileSystem Tools)
 * **The Problem**: By default, `CodeMode(tools='all')` wraps all tools inside the sandbox. This hides the `FileSystem` tools (`list_directory`, `read_file`, `write_file`, `grep_search`) from the agent as native top-level tool calls. 
-  However, in [SKILL.md](file:///home/mdfranz/github/nuevo-pydantic/pydantic-security-skills/skills/suricata-analyst/SKILL.md), the instructions explicitly direct the agent to call these natively:
+  However, in [SKILL.md](../skills/suricata-analyst/SKILL.md), the instructions explicitly direct the agent to call these natively:
   > *Before writing any analysis code, call `list_directory(path='.')` (the FileSystem tool, not `run_code`) to see what's actually in the workspace...*
   
   Because the tools are sandboxed, the agent cannot call `list_directory` natively. It is forced to run `run_code` and execute Python code just to list files or read a template, which is slow, consumes more tokens, and burns model turns.

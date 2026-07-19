@@ -8,11 +8,11 @@
 #     scripts/compare_models.sh "Summarize the ports and protocols seen in the EVE log."
 #
 # Optional env vars:
-#   SKILL_DIR  - skill directory to run (default: skills/suricata-analyst, same as runner.py)
-#   WORKSPACE  - workspace base/case root (default: ./workspace, same as runner.py)
+#   SKILL_DIR  - skill directory to run (default: skills/suricata-analyst, same as skill-runner)
+#   WORKSPACE  - workspace base/case root (default: ./workspace, same as skill-runner)
 #
-# Any extra arguments after the prompt are passed through to runner.py as-is, e.g.:
-#   scripts/compare_models.sh "..." --thinking medium
+# Any extra arguments after the prompt are passed through to skill-runner as-is, e.g.:
+#   ./compare_models.sh "..." --thinking medium
 
 set -uo pipefail
 
@@ -23,7 +23,7 @@ if [ -z "${MODELS:-}" ]; then
 fi
 
 if [ "$#" -lt 1 ]; then
-  echo "usage: MODELS=\"model1 model2 ...\" $0 \"<prompt>\" [extra runner.py args...]" >&2
+  echo "usage: MODELS=\"model1 model2 ...\" $0 \"<prompt>\" [extra skill-runner args...]" >&2
   exit 1
 fi
 
@@ -47,7 +47,7 @@ echo "Running against $model_count model(s), each in a fresh --pristine workspac
 for model in $MODELS; do
   echo
   echo "=== $model ==="
-  uv run runner.py "$SKILL_DIR" "$PROMPT" \
+  uv run skill-runner "$SKILL_DIR" "$PROMPT" \
     --model "$model" \
     --workspace "$WORKSPACE" \
     --pristine \
