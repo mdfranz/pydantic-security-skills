@@ -472,7 +472,13 @@ class AnalystApp(App):
     @work
     async def action_quit(self) -> None:
         # Overrides App's default action_quit (bound to Ctrl+Q), which exits immediately --
-        # push_screen_wait requires an active worker context, hence @work here.
+        # push_screen_wait requires an active worker context, hence @work here. Each Ctrl+Q
+        # press spawns its own worker (no exclusive= group), so without this guard a second
+        # press while the dialog is already open stacks a *second* QuitConfirmScreen -- it
+        # only becomes visible after cancelling the first, looking like the app is asking
+        # twice.
+        if isinstance(self.screen, QuitConfirmScreen):
+            return
         if await self.push_screen_wait(QuitConfirmScreen()):
             self.exit()
 
