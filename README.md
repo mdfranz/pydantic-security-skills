@@ -70,7 +70,13 @@ Drop your log data into `./workspace/data` (created automatically on first run),
 ```bash
 export GEMINI_API_KEY="your-gemini-api-key"
 
-# skill_dir defaults to skills/suricata-analyst; task defaults to "default"
+# Run a model in interactive mode (prompts you for the query):
+./run.sh google:gemini-3.5-flash
+
+# Or specify a different skill directory:
+./run.sh google:gemini-3.5-flash skills/osqueryd-analyst
+
+# Run raw command: skill_dir defaults to skills/suricata-analyst; task defaults to "default"
 uv run runner.py "Identify the top 5 source IPs by event count in eve.json"
 
 # Or target a different skill / task / model explicitly:
@@ -78,17 +84,44 @@ uv run runner.py skills/suricata-analyst "Analyze security events" --task surica
 
 # Or start from a clean workspace, isolated from any prior run:
 uv run runner.py skills/suricata-analyst "Baseline analysis" --pristine
+
+# Or open the Textual TUI instead of the plain console (requires the `tui` extra, see below):
+uv run runner.py skills/suricata-analyst "Baseline analysis" --ui textual
+
+# The prompt itself is optional only with --ui textual -- an empty session opens and the
+# first message is typed into the bottom bar. Console mode always requires a prompt.
+uv run runner.py --ui textual
 ```
 
 Flags:
-- `--model` — model ID (default `google:gemini-3-flash-preview`).
+- `--model` — model ID (default `google:gemini-3-flash-preview`; see `models.yaml` for aliases).
+- `--ui` — `console` (default) or `textual`. `console` is today's raw-print behavior, meant for
+  scripts and quick one-shot runs. `textual` opens a multi-panel TUI (tool calls, model
+  output/thinking, a live artifacts tree, and a bottom bar that always accepts free-text
+  follow-up prompts) for interactive investigation sessions — see "TUI mode" below.
 - `--workspace` — the workspace base/case root (default `./workspace`); see "Task-scoped workspaces" above.
 - `--task` — reuse (or create) a named task workspace; accumulates across runs.
 - `--pristine` — start a fresh, isolated task workspace with no prior agent state.
-- `--debug` — prints the Python code the model generated and ran inside the Monty sandbox for each `run_code` call, plus its return value.
-- `--logfire` — traces the run with [Logfire](https://pydantic.dev/logfire). Prints a live span tree to the console with zero setup; also ships to the Logfire UI once authenticated (see below).
+- `--debug` — prints the Python code the model generated and ran inside the Monty sandbox for each `run_code` call, plus its return value (console mode only; Textual's panels are always untruncated and scrollable).
+- `--logfire` — traces the run with [Logfire](https://pydantic.dev/logfire). Prints a live span tree to the console with zero setup (suppressed under `--ui textual`, so it doesn't corrupt the TUI's alternate screen); also ships to the Logfire UI once authenticated (see below).
+- `--interactive` — adds "pause and checkpoint" instructions to the system prompt. In console mode this also drives a blocking continue/stop/focus loop after each response; under `--ui textual` it only affects the system prompt, since the bottom bar already always accepts free-text follow-ups.
 - `--thinking` — enables model thinking/reasoning with a specified effort level (`low`, `medium`, `high`, `xhigh`). Useful for complex reasoning tasks on supporting models (e.g. Gemini 3+ / Claude Opus 4.6+).
 - `--max-tokens` — the maximum number of tokens to generate before stopping. Defaults to automatically scaling when thinking effort is set, preventing Anthropic API validation errors.
+
+### TUI mode
+
+`--ui textual` requires the optional `tui` extra:
+
+```bash
+uv sync --extra tui
+```
+
+Console-only installs are unaffected — `textual` is only imported lazily, inside the `--ui
+textual` branch. Both UIs consume the same event stream and write the same artifacts
+(`analyst_log-*.md`, `generated_code/*.py`, the audit JSONL); the TUI is a different way of
+*watching* a run, not a different run. A multi-turn Textual session checkpoints the same report
+after every successful turn and lists every prompt submitted so far, rather than the single
+`- Prompt:` line console mode's single-turn report uses.
 
 Every run also retains artifacts. Inside the task directory (`<workspace>/<task>/`):
 `generated_code/` contains each generated `run_code` program, and

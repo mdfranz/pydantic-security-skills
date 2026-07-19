@@ -16,7 +16,7 @@ back out as durable, human-readable artifacts.
 
 ```mermaid
 flowchart TB
-    subgraph Host["Host process (runner.py)"]
+    subgraph Host["Host process (runner.py + run_core.py)"]
         Skill["Skill directory\nSKILL.md + skill.yaml + references/*.md"]
         Agent["Agent (pydantic-ai)"]
         FS["FileSystem capability"]
@@ -28,6 +28,7 @@ flowchart TB
         Logs[("Audit log (host-only)\nworkspace/logs/")]
         MemStore[("Memory notebook\nworkspace/memory/<skill>/<task>/")]
         Monty["Monty sandbox"]
+        Sink["RunSink\nConsoleSink (console_ui.py) or\nTextualSink (ui_textual.py)"]
         Artifacts["Artifacts:\nanalyst_log-*.md\ngenerated_code/*.py"]
 
         Skill -- "instructions" --> Agent
@@ -41,7 +42,8 @@ flowchart TB
         Monty -- "mount /workspace (rw)" --> TaskWs
         Monty -- "mount /data (ro)" --> Data
         Monty -- "mount /skill (ro)" --> Skill
-        Agent -- "writes" --> Artifacts
+        Agent -- "event_stream_handler:\nmodel text/thinking, tool calls/results" --> Sink
+        Sink -- "write_artifacts()" --> Artifacts
         Artifacts -.-> TaskWs
         Agent -. "run_start/prompt/tool/error/run_end events\n(host writes directly, never agent-visible)" .-> Logs
     end
@@ -49,25 +51,64 @@ flowchart TB
     Agent -. "optional" .-> Logfire["Logfire (traces, task_id/run_id metadata)"]
 ```
 
-### Runner (`runner.py`)
+### Runner (`runner.py` + `run_core.py` + UI drivers)
 
-The only long-lived process. It has five responsibilities, and nothing else:
+`runner.py` itself is a thin CLI entrypoint now: argparse (including the shared
+`[skill_dir] prompt` positional grammar and the `--ui` flag), the `--ui textual`
+optional-dependency guard, and dispatch to one of two UI drivers. Everything that used to be
+one large `main()` moved into `run_core.py`, which both drivers depend on and which has five
+responsibilities, and nothing else:
 
 1. **Resolves the task** for this run — a named `--task` (accumulate), an auto-generated
    `--pristine` id, or the shared `default` — and derives the task-scoped workspace root from it.
    See "Task-scoped workspaces" below.
 2. **Assembles** a skill's instructions + shared runtime notes into one system prompt, and wires
    up the agent's capabilities.
-3. **Drives** the agent loop (`agent.run_sync`), including the optional interactive
-   checkpoint/continuation loop.
+3. **Drives** the agent loop through shared per-turn helpers (`run_turn_sync`/`run_turn_async`),
+   each of which records the audit `prompt` event immediately before calling the agent.
 4. **Persists** everything the run produced — audit log, generated code, final report — as
-   plain files, independent of whether the model chose to save anything itself.
+   plain files (`write_artifacts`), independent of whether the model chose to save anything
+   itself.
 5. **Maintains** the task workspace between runs: linting previously-saved scripts for sandbox
    incompatibilities, and telling the agent what already exists there (and what input files are
    available) before it starts.
 
-It contains no analysis logic itself — it never parses a log file or knows what a "suspicious
-SNI" is. All domain knowledge lives in skills.
+Neither `run_core.py` nor the runner contains any analysis logic itself — it never parses a log
+file or knows what a "suspicious SNI" is. All domain knowledge lives in skills.
+
+#### Two UI backends, one `RunSink` contract
+
+`--ui console` (default) and `--ui textual` are two independent *observers* of the same run —
+neither produces different artifacts or a different event vocabulary, they just render it
+differently:
+
+- **`console_ui.py`** (`ConsoleSink`, `run_console`) — today's behavior: raw `print()`s to a flat
+  terminal, plus a blocking `input()` checkpoint loop under `--interactive`. Still calls
+  `agent.run_sync` synchronously; nothing here is async.
+- **`ui_textual.py`** (`TextualSink`, `AnalystApp`, `run_textual`) — a multi-panel TUI (a
+  `DataTable` pairing tool calls with their results by `tool_call_id`, a `RichLog` for model
+  text/thinking, a live `DirectoryTree` of the task workspace, and a bottom `Input` bar that
+  always accepts free-text follow-ups). Drives the agent with `await agent.run(...)` inside a
+  Textual `@work` coroutine, on the App's own asyncio loop — never `run_sync`, never a thread.
+  Imported lazily, only when `--ui textual` is selected, so a console-only install never imports
+  `textual`.
+
+Both sinks implement the same `RunSink` protocol (`status(message)` for one-off lines,
+`emit(kind, **fields)` for the same event vocabulary `AuditLog.event` persists), constructed by
+`make_event_stream_handler(audit, sink)` in `audit.py`, which calls both `audit.event(...)` and
+`sink.emit(...)` with identical `(kind, fields)` for every event — the sink always sees exactly
+what the audit log persists. A multi-turn Textual session checkpoints the same
+`analyst_log-<run_stamp>.md` after every successful turn (via the shared `ArtifactSession` /
+`write_artifacts`), listing every submitted prompt rather than claiming the latest follow-up was
+the sole original one; a failed or interrupted turn leaves the prior checkpoint intact.
+
+SIGTERM handling differs by necessity between the two: console mode relies on `audit.py`'s raw
+`signal.signal(SIGTERM, ...)` handler, which raises straight through the blocking `run_sync`
+call. Under Textual, that same raw handler can instead land inside asyncio's own internals
+(observed during testing landing mid-`select()`) rather than inside the running turn's
+coroutine — so `AnalystApp` takes over `SIGTERM` via `asyncio`'s own `add_signal_handler` once
+mounted, resolving any delivery to a clean, deterministic `self.exit()` regardless of whether a
+turn is active.
 
 ### Skill (`skills/<name>/`)
 

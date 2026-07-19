@@ -401,3 +401,92 @@ match. `refs/workspace-lifecycle.md` remains the design source of truth.
 automatically injected rather than depending on the agent's initiative to re-read old
 `analyst_log-*.md` files; `--pristine` and `compare_models.sh` are structurally unaffected — the
 capability doesn't exist for those runs at all, not just an empty one.
+
+---
+
+### Phase 10: Caching, Token-Overflow Safeguards, and Interactive Wrapper (2026-07-18, 21:00)
+
+**Objective:** Address high-priority developer issues in `ISSUES.md` related to redundant log rescans and token overflow, and provide a simplified wrapper script for running models interactively.
+
+**Work:**
+- Added caching guidelines to the `osqueryd-analyst` skill instruction `Step 2: Targeted Analysis` in `skills/osqueryd-analyst/SKILL.md` to instruct the agent to save derived data (such as process/socket mapping) in the task workspace and reuse it to avoid linear rescans of large files.
+- Added a `Python Style & Working Agreements` section to `prompts/sandbox_notes.md` to enforce token-overflow prevention across all skills. It requires models to aggregate/summarize in Python code and restricts detailed listings to at most ~50 lines per run.
+- Implemented `run.sh` as a convenient bash wrapper at the repository root. It runs a model in interactive mode by default, prompts the user for the prompt/query, supports an optional skill directory, and forwards any extra arguments (e.g. `--debug`) to the python runner.
+- Updated `README.md` to document the usage of the new `run.sh` wrapper.
+
+**Result:** Improved performance and execution safety across all skills by eliminating token limit failures and raw log scanning overhead, and simplified interactive local execution.
+
+---
+
+### Phase 11: Hierarchical Provider Refactoring for Models (2026-07-18, 22:00)
+
+**Objective:** Refactor model configuration file to group models under hierarchical providers instead of maintaining a flat list, and update resolving logic accordingly.
+
+**Work:**
+- Refactored [models.yaml](file:///home/mdfranz/github/pydantic-security-skills/models.yaml) to group models by their provider (`google`, `openai`, `anthropic`, `openrouter`) in a hierarchical structure under the `providers` key.
+- Updated `resolve_model` in [runner.py](file:///home/mdfranz/github/pydantic-security-skills/runner.py) to parse the new hierarchical format while retaining a backward-compatible fallback to the legacy flat `models` list format.
+
+**Result:** Cleaner models configuration taxonomy and more robust model resolution.
+
+---
+
+### Phase 12: Textual TUI Mode Alongside Console UX (2026-07-18, 23:00)
+
+**Objective:** Implement `refs/textual-ui-plan.md`: add a multi-panel Textual TUI as a second,
+opt-in UI, without changing console mode's behavior or artifact shape.
+
+**Commit `3a986a8`: Split `runner.py` into `audit`/`script_lint`/`run_core`/`console_ui` modules**
+- Extracted `AuditLog`, `RunInterrupted`, the SIGTERM-to-exception plumbing, and
+  `make_event_stream_handler` into `audit.py`. The handler now calls both `audit.event(...)` and
+  `sink.emit(...)` with identical `(kind, fields)` for every event, so the active UI always sees
+  exactly what the audit log persists; per-kind label formatting moved out of the handler and into
+  each sink.
+- Extracted `lint_and_fix_scripts` into `script_lint.py`, adding an `on_message` callback so
+  neither UI leaks a raw `print()`.
+- Extracted task/workspace setup, skill/prompt assembly, `Agent` construction, the model-alias
+  resolver, the `RunSink` protocol, shared `run_turn_sync`/`run_turn_async` per-turn helpers, and
+  `ArtifactSession`/`write_artifacts` into `run_core.py` — the sole module both UI drivers depend
+  on for run behavior.
+- Extracted today's console behavior (`ConsoleSink`, checkpoint parsing, `run_console`) into
+  `console_ui.py`, unchanged byte-for-byte: same `agent.run_sync`, same blocking `input()`
+  checkpoint loop, same report/artifact shape.
+- `runner.py` reduced to a thin CLI entrypoint.
+- Verified via unit tests against the extracted pure functions (`parse_checkpoint_input`,
+  `build_continuation_prompt`, `write_artifacts`, `lint_and_fix_scripts`) and live runs (`--model
+  test`, TestModel) confirming identical console output, audit-log sequencing, and report
+  structure pre/post-refactor.
+
+**Commit `9a9e165`: Add Textual TUI mode alongside console UX**
+- New `ui_textual.py`: `BufferedTextualSink` (accumulates setup-time status lines until
+  `AnalystApp` mounts and can drain them), `TextualSink` (routes streamed events into a
+  `DataTable` that pairs each tool call with its result by `tool_call_id` — updated in place
+  rather than appended, since `RichLog` has no such API — plus a `RichLog` for model
+  text/thinking and a live `DirectoryTree` of the task workspace), `AnalystApp`, and
+  `run_textual(...)`.
+- `--ui {console,textual}` (default `console`); the `[skill_dir] prompt` positional grammar
+  generalized to accept 0/1/2 values (0 valid only with `--ui textual`, opening an empty session
+  where the first bottom-bar message becomes the first turn); a `find_spec` guard before any
+  workspace side effects; `textual` added as an optional `tui` extra (`uv sync --extra tui`),
+  imported lazily so a console-only install never imports it.
+- Multi-turn Textual sessions checkpoint the same `analyst_log-<run_stamp>.md` after every
+  successful turn, listing every submitted prompt rather than claiming the latest follow-up was
+  the sole original one; a failed/interrupted turn leaves the prior checkpoint intact.
+- **SIGTERM finding during implementation:** headless testing (`App.run_test()` /
+  `App.run(headless=True)`, a real OS thread sending itself `SIGTERM` mid-turn) showed the raw
+  `signal.signal(SIGTERM, ...)` handler `run_core.prepare_run` installs (used as-is by console
+  mode) can land inside asyncio's own internals under Textual — observed interrupting
+  `_run_once`/`selector.select()` rather than the running turn's own coroutine, converting into an
+  `asyncio.CancelledError` at the `run_test()` boundary instead of a clean shutdown. Fixed by
+  having `AnalystApp` take over `SIGTERM` via `asyncio`'s own `add_signal_handler` once mounted,
+  which resolves any delivery to a deterministic `self.exit()` regardless of whether a turn is
+  active. Re-verified end to end in headless mode: a mid-turn `SIGTERM` now reliably produces the
+  `interrupted`/`run_end` audit events and propagates `RunInterrupted` for the exit-143 mapping.
+  Real-terminal verification (not just headless) is still a recommended manual check.
+
+**Docs:** Updated `ARCHITECTURE.md` (mermaid diagram routes agent events through a `RunSink`
+before `write_artifacts`; new "Two UI backends, one `RunSink` contract" subsection under Runner)
+and `README.md` (`--ui`/optional-prompt examples, new "TUI mode" section, updated flag list).
+
+**Result:** A second, fully opt-in UI for interactive investigation sessions, sharing 100% of run
+behavior with console mode through `run_core.py` — no divergence in artifacts, audit trail, or
+event vocabulary between the two.
