@@ -67,11 +67,17 @@ and dispatch to one of two UI drivers. The application code behind it is divided
   `run_end`, closes the audit, and restores the previous SIGTERM handler before re-raising.
 - **`session.py`** owns the agent loop, first-turn prompt prefix, transcript, state transitions,
   post-turn lint/artifact policy, errors and interruptions, and final audit closure. UI drivers
-  submit prompts but do not mutate the workspace or manage run lifecycle themselves.
+  submit prompts but do not mutate the workspace or manage run lifecycle themselves. Also enforces
+  the three stuck-run safeguards per turn: `--max-retries` (passed to `CodeMode`, `run_core.py`),
+  `--max-turns` (`UsageLimits.request_limit`, passed to `agent.run`/`run_sync`), and
+  `--max-run-seconds` (a wall-clock watchdog started before and cancelled after each turn — see
+  `audit.py` below).
 - **`artifacts.py`** owns the structured `Turn`/`Transcript` model, pure report rendering, and
   durable report/generated-code writes.
-- **`audit.py`** owns the append-only log and translates streamed pydantic-ai events into the
-  shared sink/audit vocabulary.
+- **`audit.py`** owns the append-only log, translates streamed pydantic-ai events into the shared
+  sink/audit vocabulary, and provides `start_turn_watchdog()` — a background timer that delivers
+  the process its own `SIGTERM` if a turn exceeds `--max-run-seconds`, deliberately reusing the
+  SIGTERM-to-`RunInterrupted` plumbing below rather than a second interruption mechanism.
 
 None of these modules contains analysis logic or knows what a "suspicious SNI" is. All domain
 knowledge lives in skills.
@@ -240,7 +246,17 @@ Two hardening details address the "Retention and permissions" open item in
   so the process died before the audit log closed. The runner now converts `SIGTERM` into a
   catchable `RunInterrupted` exception, which the `finally` block treats the same way, and exits
   `143` (the standard `128 + SIGTERM` code) to signal the process was terminated. `SIGKILL`
-  remains uncatchable by any process — an OS-level limit, not something this addresses.
+  remains uncatchable by any process — an OS-level limit, not something this addresses. This
+  mapping must be caught in `runner.py`'s `main()` itself, not only under `if __name__ ==
+  "__main__":` — the installed `skill-runner` console-script entry point calls `main()` directly
+  and never runs through that guard, so a version living only there silently never fires for the
+  primary way this tool is actually invoked (`ISSUES.md` #13).
+- **`--max-run-seconds`.** A stuck turn (no forward progress at all — a hung network request, as
+  opposed to a slow-but-working one) gets the identical clean shutdown as an external `SIGTERM`:
+  `audit.py`'s `start_turn_watchdog()` starts a background timer per turn that delivers the
+  process its own `SIGTERM` on overrun, letting the same conversion/`finally`/exit-143 path above
+  handle it, rather than adding a second interruption mechanism. The timer is cancelled once the
+  turn finishes on its own.
 
 ### Observability (Logfire, optional)
 

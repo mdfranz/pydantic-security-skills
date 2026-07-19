@@ -543,3 +543,87 @@ ownership explicit, and prevent the console and Textual drivers from drifting ap
 **Result:** The UI drivers now collect input and render output while one session layer enforces
 run behavior. `run_core.py` fell from 674 to 381 lines and `ui_textual.py` from 561 to 309 lines,
 with audit cleanup defined for both setup-time and turn-time failures.
+
+---
+
+### Phase 15: Model-Comparison Testing & Stuck-Run Safeguards (2026-07-19, 11:21-14:47)
+
+**Objective:** Use `--pristine`/`--logfire` model comparisons — not just code review — to find
+real behavioral and reliability gaps across the model roster, then close the ones with the
+clearest evidence.
+
+**Commit `ba285bb` (11:21): Pristine model-comparison results and expanded `ISSUES.md`**
+- Ran a 9-run `--pristine` matrix (gemini-3-flash-preview, glm-5.2, qwen3.6-flash × 3 reps,
+  identical prompt/data, isolated workspaces) specifically to separate genuine per-model habits
+  from workspace-accumulation confounds present in the 2026-07-18 comparison.
+- **Structural findings:** whether a model ever calls `write_file` (a persistent, named script) vs.
+  relying solely on `run_code` (auto-snapshotted to `generated_code/`, regardless of intent) is a
+  real per-model habit, not chance — glm-5.2 did it in all 3 reps, gemini in 1 of 3, qwen in 0 of 3.
+  glm-5.2 was also 5-8x slower than the other two (495-812s vs. 105-166s) while doing comparable
+  work — thorough, not stuck, which specifically motivated a wall-clock (not turn-count) safety net.
+- **Qualitative findings (the more important half):** read each run's actual `## Final Findings`
+  write-up, not just call counts, and verified the disputed signals directly against the raw
+  `eve-2026-01-06-01.json` rather than trusting the reports' own numbers. A real 53-hour flow
+  (`192.168.2.197→192.200.0.106:80`, confirmed via `grep`: exactly 1 matching record, `flow.age:
+  192346`) was flagged as likely C2 by gemini-3-flash-preview in only 1 of its 3 identical reps. A
+  real MQTT beacon (`192.168.3.105→20.44.17.102:8883`, confirmed: exactly 125 flows) was
+  investigated by glm-5.2 in all 3 reps using the same beacon-scan methodology each time, but its
+  own severity verdict flipped — "low risk" in rep 1, "HIGH confidence, isolate the host" in reps 2
+  and 3. Same model, same prompt, same data, opposite conclusions on the actual security question —
+  the first hard evidence in this project that model non-determinism affects analytical outcomes,
+  not just process/style.
+- qwen3.6-flash crashed 2 of 3 reps, each a different mode: tool-retry exhaustion on a
+  Monty-unsupported `{x:,}` format specifier, and a context-window overflow from an unbounded
+  `print(json.dumps(s))` loop over all 1,440 `stats` events (24.7M chars fed back into its own
+  context). A project-wide scan of every `workspace/logs/*.jsonl` and the full Logfire exception
+  history (not just this test's own logs) found both failure modes recurring independently in
+  earlier, unrelated sessions — confirming systemic weaknesses, not flukes — plus five more issues:
+  undocumented Monty stdlib/builtin gaps (`collections` missing entirely, 7 occurrences — the
+  single most common recoverable error project-wide), a static-type-check-vs-runtime error class
+  distinction that actively misleads the model, the single most-repeated error in the project's
+  history (`FileSystem` "path resolves outside the root directory" — models reaching for `/data`
+  through the wrong tool, 11+ occurrences despite SKILL.md already warning against it), and
+  unvalidated `--model` CLI input surfacing typos as opaque provider 404s instead of a local hint.
+- Filed as `ISSUES.md` #5-#11.
+
+**Commit `d548c1b` (14:47): `--max-retries`/`--max-run-seconds`/`--max-turns`, and a real exit-code
+bug found while validating them**
+- A second `--pristine` comparison (deepseek-v4-pro, kimi-k3, minimax-m3 × 3 reps, same
+  prompt/data) surfaced a failure class distinct from #5/#6: raw network exceptions, uncaught,
+  including a kimi-k3 rep that hung **silently for ~2 hours** (audit log: last real activity at
+  `15:37:40 UTC`, `httpx.ReadTimeout` not raised until `17:34:32 UTC`) before producing nothing.
+  Filed as `ISSUES.md` #12 — the strongest evidence yet that a wall-clock budget, not just a
+  turn-count or retry-count cap, was needed.
+- Added three CLI flags: `--max-retries` (default 5, up from `CodeMode`'s hardcoded 3 —
+  `run_core.py`), `--max-turns` (`UsageLimits(request_limit=...)`, previously silently defaulted to
+  50 and untunable — `session.py`), and `--max-run-seconds` (a per-turn wall-clock budget). The
+  wall-clock budget is enforced by `audit.py`'s new `start_turn_watchdog()`: a background
+  `threading.Timer` that sends the process its own `SIGTERM` on overrun, deliberately reusing the
+  existing `SIGTERM`→`RunInterrupted` clean-shutdown path from Phase 8 instead of a second
+  interruption mechanism — verified this delivers correctly to the main thread even from inside a
+  running `asyncio` event loop (isolated repro: interrupted an `asyncio.run()` sleep at exactly
+  2.0017s against a 2s budget).
+- **Bug found while validating live against a real model:** an interrupted run crashed with a raw
+  traceback and exit 1, not the clean exit 143 `RunInterrupted`/`map_run_interrupted_exit_code()`
+  are designed to produce. Root cause: `runner.py`'s `main()` never actually caught
+  `RunInterrupted` — that mapping only existed under `if __name__ == "__main__":`, which the
+  installed `skill-runner` console-script entry point (`pyproject.toml`'s `skill-runner =
+  "skill_runner.runner:main"`, what `uv run skill-runner` actually invokes everywhere in this repo)
+  never runs through; confirmed via the crash traceback itself
+  (`.venv/bin/skill-runner: sys.exit(main())`, no guard in between). **This means real Ctrl+C and
+  SIGTERM have crashed the same way since the console-script entry point was added in Phase 13** —
+  not something this change introduced, just something it exposed. Fixed by moving the catch into
+  `main()` itself. Filed and closed as `ISSUES.md` #13.
+- Added `tests/test_audit.py` (watchdog: no-budget, cancel-before-fire, fire-and-interrupt) and a
+  `test_session.py` integration test proving the wiring through `RunSession.submit_sync`. 9/9 tests
+  pass.
+- **Verified live:** `--max-run-seconds 5` against `google:gemini-3-flash-preview` now exits `143`
+  with no traceback in ~7s (5s budget + startup overhead), and the audit log shows a clean
+  `interrupted` → `run_end status=failed` sequence instead of an `error` event.
+
+**Result:** Two rounds of `--pristine` model-comparison testing found nine new, evidenced issues
+(`ISSUES.md` #5-#13) — including one, #13, that had been silently defeating the project's own
+Ctrl+C/SIGTERM safety net since Phase 13. Three now have shipped fixes: retry exhaustion
+(`--max-retries`), unbounded hangs (`--max-run-seconds`), and the exit-code bug itself. Six remain
+open and documented for follow-up (Monty stdlib gaps, the `FileSystem` path-confusion error, model
+CLI validation, and the qwen3.6-flash-specific crash patterns' upstream mitigations).

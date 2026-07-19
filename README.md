@@ -18,6 +18,7 @@ threats, suspicious egress, protocol anomalies).
 - [`PYDANTIC-STACK.md`](PYDANTIC-STACK.md) — how the pydantic-ai/harness/Monty stack is wired
   together, and why.
 - [`PROJECT.md`](PROJECT.md) — development history and design decisions by phase.
+- [`ISSUES.md`](ISSUES.md) — known issues and improvement backlog, evidenced from real runs.
 
 ## How it works
 
@@ -107,6 +108,9 @@ Flags:
 - `--interactive` — adds "pause and checkpoint" instructions to the system prompt. In console mode this also drives a blocking continue/stop/focus loop after each response; under `--ui textual` it only affects the system prompt, since the bottom bar already always accepts free-text follow-ups.
 - `--thinking` — enables model thinking/reasoning with a specified effort level (`low`, `medium`, `high`, `xhigh`). Useful for complex reasoning tasks on supporting models (e.g. Gemini 3+ / Claude Opus 4.6+).
 - `--max-tokens` — the maximum number of tokens to generate before stopping. Defaults to automatically scaling when thinking effort is set, preventing Anthropic API validation errors.
+- `--max-retries` — max retries for a failing `run_code` call before the turn aborts (default `5`). Raised from `CodeMode`'s own default of 3 after a model got stuck retrying the same Monty-unsupported syntax repeatedly; see [`ISSUES.md`](ISSUES.md) #5.
+- `--max-run-seconds` — a wall-clock budget per turn. A turn that runs longer is cleanly interrupted the same way Ctrl+C/SIGTERM is — partial progress kept, audit log records the interruption, process exits `143`. No limit by default. Added after a run hung silently for ~2 hours before failing; see [`ISSUES.md`](ISSUES.md) #12.
+- `--max-turns` — max model round-trips per turn, passed through to `pydantic_ai`'s `UsageLimits.request_limit` (default: pydantic_ai's own default of 50).
 
 ### TUI mode
 
