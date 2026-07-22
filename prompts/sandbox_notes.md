@@ -35,6 +35,31 @@ Four different path namespaces are in play — do not mix them up:
   `/skill` to this tool fails with "Path resolves outside the root directory" — those prefixes
   are only meaningful inside `run_code`.
 
+## Fast Input Queries: `query_events(...)`
+
+For large input logs, a host-side helper is callable directly from `run_code`:
+
+```python
+rows = query_events(name="eve-2026-01-06-01.json", event_type="alert",
+                    columns=["timestamp", "src_ip", "dest_ip"], limit=100)
+```
+
+- `name` is the **bare input filename** exactly as listed under `/data` at the start of your
+  prompt (e.g. `eve-2026-01-06-01.json`) — **not** a path. Do not pass `/data/...`, `/workspace`,
+  `..`, or an absolute path; those are rejected.
+- `event_type` (optional) filters to one Suricata event type; `columns` (optional) selects fields;
+  `limit` caps the number of rows returned (default 100).
+- It returns a plain `list[dict]` of already-parsed rows — no JSON decoding needed on your side.
+- It runs Polars **on the host**, so you still cannot `import polars`/`duckdb` inside the sandbox;
+  the sandbox stdlib limits below still apply to your own code.
+- The first call converts the log to a compressed Parquet cache (one-time cost); later calls are
+  much faster. Prefer `query_events` over hand-rolled line-by-line NDJSON parsing when you need a
+  filtered slice of a large file.
+- It does **not** aggregate for you — there is no host-side group-by. Pull the rows you need with
+  `event_type`/`columns`/`limit`, then count/summarize them in your own sandbox code (respecting
+  the output limits below). Keep `limit` modest and filter server-side rather than pulling the
+  whole file back as rows.
+
 File objects from `pathlib.Path(...).open()` do **not** support `for line in f:` — that raises
 `TypeError: '_io.TextIOWrapper' object is not iterable`. Always read line-by-line with an explicit
 loop instead:
