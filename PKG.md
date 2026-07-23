@@ -21,10 +21,12 @@ This document lists and classifies the 3rd party dependencies used in the
 *   **[pydantic-ai-harness](https://github.com/pydantic/pydantic-ai-harness)**
     (`[codemode]`, `>=0.7.0`): the sandboxed-execution and native-tool layer on top of
     pydantic-ai. `run_core.py` uses `CodeMode` (the `run_code` sandbox tool, configured with
-    `tools=[]` so `FileSystem`'s tools stay native rather than routed through it — see
-    `PYDANTIC-STACK.md` for why) and `FileSystem` (task-scoped native
-    read/write/search-file tools), plus `memory.FileStore`/`Memory` for the accumulate-mode
-    notebook capability. `skill_runner/resilience.py` uses
+    `tools=["describe_events", "query_events", "aggregate_events", "query_sql"]` so only those
+    four host-side data-query helpers are routed through it and `FileSystem`'s tools stay native
+    — see `PYDANTIC-STACK.md` for why) and `FileSystem` (task-scoped native read/write/search-file
+    tools), plus
+    `memory.FileStore`/`Memory` for the accumulate-mode notebook capability. `skill_runner/
+    resilience.py` uses
     `overflowing_tool_output.{Band,LocalFileStore,OverflowingToolOutput,Spill,Truncate}` to
     spill oversized tool returns outside model history. The `[codemode]` extra is what pulls in
     `pydantic-monty` (see "Indirect, but directly imported" below) — without it, `CodeMode`
@@ -35,9 +37,32 @@ This document lists and classifies the 3rd party dependencies used in the
 *   **[pydantic-monty](https://github.com/pydantic/monty)** (indirect — see below): the actual
     sandboxed Python interpreter `run_code` executes inside. Not a direct dependency in
     `pyproject.toml`; pulled in transitively by `pydantic-ai-harness[codemode]`'s own `codemode`
-    extra. `run_core.py` imports `MountDir` (the three sandbox mounts: `/workspace` read-write,
-    `/skill` and `/data` read-only) and `OSAccess` (constructed with `environ={}`, so sandboxed
-    code gets no environment variables at all) directly, to configure `CodeMode`.
+    extra. `run_core.py` imports `MountDir` (the sandbox mounts: `/workspace` read-write,
+    `/skill`, `/data-source`, and its `/data` alias, all read-only) and `OSAccess` (constructed
+    with `environ={}`, so sandboxed code gets no environment variables at all) directly, to
+    configure `CodeMode`.
+
+## Fast Data Queries
+
+*   **[Polars](https://pola.rs/)** (`>=1.0.0`): a **host-side-only** dependency — never available
+    inside the Monty sandbox itself, which has no third-party imports at all. `skill_runner/
+    data_tools.py` uses `pl.scan_ndjson(...).sink_parquet(...)` to lazily convert an input log to
+    a compressed Parquet cache on first query, and `pl.scan_parquet(...)` plus `.filter()`/
+    `.select()`/`.group_by()`/`.agg(pl.len())`/`.collect_schema()` to serve `query_events`/
+    `aggregate_events`/`describe_events`'s bounded pages, exact aggregates, and schema pages.
+    These functions run on the host process and are exposed to the model only as ordinary
+    sandboxed function calls (see `CodeMode` above) — the model never gets `import polars` inside
+    `run_code`, only typed arguments and plain-dict results.
+*   **[duckdb](https://duckdb.org/)** (`>=1.5.5`): a **host-side-only** dependency backing
+    `query_sql`, the one data tool that lets the model author its own SQL. Unlike `polars-runtime`
+    packages, `duckdb` ships CPython-version-specific wheels (no `abi3` forward compatibility), so
+    its availability needs re-checking on every Python version bump — see `SQL_QUERY_PLAN.md` §2.
+    `data_tools.py`'s `query_sql` opens a fresh in-memory connection per call, sets
+    `allowed_paths`/`memory_limit`/`temp_directory` before disabling `enable_external_access`,
+    registers a lazy `VIEW` over the same Parquet cache the other three tools use, and runs the
+    model's `SELECT` against it with a wall-clock timeout via `con.interrupt()`. Also uses
+    `duckdb.extract_statements`/`duckdb.StatementType` to reject anything but exactly one
+    `SELECT`/`WITH ... SELECT` statement before it ever reaches the connection.
 
 ## Configuration & Skill Loading
 

@@ -6,6 +6,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
@@ -126,6 +127,8 @@ def make_event_stream_handler(audit: AuditLog, sink: "RunSink"):
     so the active UI always sees exactly what the audit log persists. Per-kind label/formatting
     lives in each sink's own emit -- this handler stays UI-agnostic."""
 
+    call_start_times: dict[str, float] = {}
+
     async def handler(ctx, event_iter):
         async for event in event_iter:
             if isinstance(event, PartEndEvent):
@@ -138,6 +141,7 @@ def make_event_stream_handler(audit: AuditLog, sink: "RunSink"):
                     sink.emit("model_thinking", content=part.content)
             elif isinstance(event, FunctionToolCallEvent):
                 part = event.part
+                call_start_times[part.tool_call_id] = time.monotonic()
                 args = part.args_as_dict() if part.args else None
                 if part.tool_name == "run_code":
                     code = (args or {}).get("code") or ""
@@ -155,9 +159,16 @@ def make_event_stream_handler(audit: AuditLog, sink: "RunSink"):
                 tool_name = getattr(part, "tool_name", None)
                 content = getattr(part, "content", None)
                 kind = "run_code_return" if tool_name == "run_code" else "tool_result"
+                start_time = call_start_times.pop(part.tool_call_id, None)
+                duration_ms = (
+                    round((time.monotonic() - start_time) * 1000, 2)
+                    if start_time is not None
+                    else None
+                )
                 fields = {
                     "tool_call_id": part.tool_call_id,
                     "tool_name": tool_name,
+                    "duration_ms": duration_ms,
                     "content": content,
                     **_overflow_metadata(part),
                 }

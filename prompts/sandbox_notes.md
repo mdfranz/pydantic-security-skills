@@ -13,58 +13,133 @@ instead. This run has its own task workspace, mounted read-write at `/workspace`
 written with `write_file` are reachable at `/workspace/<name>` from sandboxed code — this is
 where you save reusable scripts, reports, and other output; it accumulates or resets per the
 runner's task mode, but it never contains the case's input evidence. Canonical input evidence
-(the logs you're asked to analyze) is separately mounted **read-only** at `/data` — the runner
-lists what's there at the start of your prompt (as `/data/<filename>`); use those exact paths in
-`run_code`, and do not assume a fixed input filename. The skill's own directory is also mounted
-**read-only**, at `/skill`, so its reference material lives at `/skill/references/<name>` —
-readable from `run_code` only, since the FileSystem tool's root is the task workspace, not the
-skill directory or `/data`.
+(the logs you're asked to analyze) is separately mounted **read-only** at `/data-source` (also
+aliased at `/data`, for backwards compatibility — both point at the same directory) — the runner
+lists what's there at the start of your prompt (as `/data-source/<filename>`); use those exact
+paths in `run_code`, and do not assume a fixed input filename. The skill's own directory is also
+mounted **read-only**, at `/skill`, so its reference material lives at `/skill/references/<name>`
+— readable from `run_code` only, since the FileSystem tool's root is the task workspace, not the
+skill directory or `/data-source`.
 
 Four different path namespaces are in play — do not mix them up:
 - **`run_code` (Monty sandbox), workspace mount**: read-write, absolute against the mount, e.g.
   `/workspace/<filename>`. This is where you write scripts and other output — never input data.
-- **`run_code` (Monty sandbox), data mount**: read-only, e.g. `/data/<filename>`. This is where
-  case input evidence lives; the runner tells you what's there at the start of your prompt.
-  Writes here fail.
+- **`run_code` (Monty sandbox), data mount**: read-only, e.g. `/data-source/<filename>` (also
+  reachable at `/data/<filename>`). This is where case input evidence lives; the runner tells you
+  what's there at the start of your prompt. Writes here fail.
 - **`run_code` (Monty sandbox), skill mount**: read-only, e.g. `/skill/references/<name>`. Writes
   here fail — this mount exists for reading reference material, not saving anything.
 - **`list_directory` / `read_file` / `write_file` (FileSystem tool)**: paths are relative to the
   task workspace root itself, e.g. `list_directory(path='.')` or `write_file('notes.md', ...)`.
-  This tool can only reach the task workspace — it cannot see `/data` or `/skill` at all, so use
-  `run_code` (not this tool) to discover or read input files. Passing `/workspace`, `/data`, or
-  `/skill` to this tool fails with "Path resolves outside the root directory" — those prefixes
-  are only meaningful inside `run_code`.
+  This tool can only reach the task workspace — it cannot see `/data-source` or `/skill` at all,
+  so use `run_code` (not this tool) to discover or read input files. Passing `/workspace`,
+  `/data-source`, `/data`, or `/skill` to this tool fails with "Path resolves outside the root
+  directory" — those prefixes are only meaningful inside `run_code`.
 
-## Fast Input Queries: `query_events(...)`
+## Fast Input Queries: `query_events(...)`, `aggregate_events(...)`, `describe_events(...)`
 
-For large input logs, a host-side helper is callable directly from `run_code`:
+For large input logs, host-side helpers are callable directly from `run_code` — call them
+synchronously, without `await`:
 
 ```python
-rows = query_events(name="eve-2026-01-06-01.json", event_type="alert",
-                    columns=["timestamp", "src_ip", "dest_ip"], limit=100)
+page = query_events(name="eve-2026-01-06-01.json", event_type="alert",
+                     equals={"proto": "TCP", "dest_port": 443},
+                     columns=["timestamp", "src_ip", "dest_ip"], limit=100)
+# page = {"rows": [...], "offset": 0, "returned": 100, "has_more": True}
+
+totals = aggregate_events(name="eve-2026-01-06-01.json", group_by=["event_type"])
+# totals = {"groups": [{"event_type": "alert", "count": 4213}, ...], "truncated": False}
+
+schema = describe_events(name="eve-2026-01-06-01.json", limit=100)
+# schema = {"columns": [{"name": "tls", "dtype": "Struct[...]"}, ...], "offset": 0,
+#           "returned": 42, "has_more": False}
 ```
 
-- `name` is the **bare input filename** exactly as listed under `/data` at the start of your
-  prompt (e.g. `eve-2026-01-06-01.json`) — **not** a path. Do not pass `/data/...`, `/workspace`,
-  `..`, or an absolute path; those are rejected.
-- `event_type` (optional) filters to one Suricata event type; `columns` (optional) selects fields;
-  `limit` caps the number of rows returned (default 100).
-- It returns a plain `list[dict]` of already-parsed rows — no JSON decoding needed on your side.
-- It runs Polars **on the host**, so you still cannot `import polars`/`duckdb` inside the sandbox;
-  the sandbox stdlib limits below still apply to your own code.
-- The first call converts the log to a compressed Parquet cache (one-time cost); later calls are
-  much faster. Prefer `query_events` over hand-rolled line-by-line NDJSON parsing when you need a
-  filtered slice of a large file.
-- It does **not** aggregate for you — there is no host-side group-by. Pull the rows you need with
-  `event_type`/`columns`/`limit`, then count/summarize them in your own sandbox code (respecting
-  the output limits below). Keep `limit` modest and filter server-side rather than pulling the
-  whole file back as rows.
+All take `name`, the **bare input filename** exactly as listed under `/data-source` at the start
+of your prompt (e.g. `eve-2026-01-06-01.json`) — **not** a path. Do not pass `/data-source/...`,
+`/data/...`, `/workspace`, `..`, or an absolute path; those are rejected. `query_events`/
+`aggregate_events`/`describe_events` run Polars **on the host** — you still cannot
+`import polars`/`duckdb` inside the sandbox; the sandbox stdlib limits below still apply to your
+own code. The first call for a given file converts it to a compressed Parquet cache (one-time
+cost); later calls (from any of these tools, including `query_sql`) reuse that cache.
+
+**`query_events`** returns a bounded **page** for inspection, never a statistically complete
+sample:
+- `event_type` (optional) filters to one event type; `equals` (optional) adds exact-match filters
+  over other top-level fields (max 10 entries, combined with AND, `None` means "is null" —
+  put `event_type` in the dedicated argument, not inside `equals`); `columns` (optional) selects
+  fields (max 50, no duplicates); `offset`/`limit` paginate (`limit` defaults to 100, capped at
+  500).
+- The result is a dict, not a plain row list: `rows` (at most `limit` rows), `offset`, `returned`,
+  and `has_more` — check `has_more` and re-call with a larger `offset` to page through the rest.
+  Never infer a whole-file total or distribution from one page.
+
+**`aggregate_events`** computes an **exact** count over the *complete* filtered dataset, ignoring
+`limit` for the input it scans — use this instead of counting rows out of a `query_events` page:
+- Accepts the same `event_type`/`equals` filters as `query_events`, applied before grouping.
+- With no `group_by`, returns `{"count": <exact total>}`.
+- With `group_by` (max 10 field names, no duplicates), returns `{"groups": [...], "truncated":
+  bool}` — groups are sorted by count descending and capped at `limit` (default 100, max 500);
+  `truncated` is true when more groups existed than were returned. The count *per group* is
+  always exact regardless of truncation — only which groups are returned is capped.
+
+**`describe_events`** returns a bounded page of top-level column names and dtype strings without
+scanning any data rows (`offset`/`limit`, `limit` capped at 500) — call this before authoring a
+`query_sql` query, since a sampled row's `dns`/`tls` struct may be null and conceal nested fields
+that are present elsewhere in the file.
+
+Prefer the typed tools over hand-rolled line-by-line NDJSON parsing for large files:
+`query_events` for a filtered slice to inspect, `aggregate_events` for exact totals or
+breakdowns, `describe_events` to discover schema. Reach for `query_sql` (below) only when the
+question is structurally beyond what these three can express — nested fields, joins across
+event types, or window/statistical functions — not merely when SQL would be more convenient.
+
+## Model-Authored SQL: `query_sql(...)`
+
+```python
+result = query_sql(
+    name="eve-2026-01-06-01.json",
+    sql="SELECT unnest(dns.queries).rrtype AS rrtype, count(*) AS n "
+        "FROM events WHERE event_type = 'dns' GROUP BY 1 ORDER BY 2 DESC",
+    limit=100,
+)
+# result = {"columns": ["rrtype", "n"], "rows": [{"rrtype": "A", "n": 1832}, ...],
+#           "returned": 6, "has_more": False}
+```
+
+`query_sql` runs one read-only SQL query, authored by you, host-side via DuckDB against the same
+Parquet cache the typed tools use — the file's rows are always queryable as a fixed view named
+`events`, regardless of the `name` you pass. This is the escape hatch for what the typed tools
+structurally cannot express:
+- **Nested fields** — `tls.sni`, `dns.queries[].rrtype`, anything under a `STRUCT`/`LIST` column.
+  Use `UNNEST(...)` and struct dot-access (`tls.sni`), as in the example above. Call
+  `describe_events` first if you're not sure a field is present or what it's called.
+- **Correlation across event types** — `JOIN events a ON ... JOIN events a2 ON ...`-style
+  self-joins, e.g. matching a `dns` row to the `tls` connection that followed it.
+- **Statistical/window functions** — `stddev`, `percentile_cont`, `ROW_NUMBER() OVER (...)`,
+  `HAVING`, multi-level `GROUP BY` — anything beyond `aggregate_events`'s single-level grouping.
+
+Rules and limits:
+- `sql` must be exactly one `SELECT` (or `WITH ... SELECT`) statement — no DDL (`CREATE`,
+  `DROP`, `ATTACH`), no `COPY`, no `PRAGMA`, no multiple statements separated by `;`. Anything
+  else is rejected before it runs, with a message you can act on.
+- `limit` (default 100, capped at 500) bounds only how many **rows are returned** — an
+  aggregate like the `GROUP BY` example above always computes over the *complete* `events` view
+  regardless of `limit`, exactly like `aggregate_events`. Check `has_more` the same way you would
+  for `query_events`.
+- Every projected column must have a unique name — alias duplicate expressions
+  (`count(*) AS n`, not two unaliased `count(*)`) or the call is rejected.
+- There is no filesystem or network access reachable from your SQL text beyond the one
+  `events` view — attempts to read another file, `ATTACH` a database, or `COPY` out fail with a
+  clear error, not a silent no-op, so don't spend a retry probing for it.
+- Queries are bounded by a wall-clock timeout; a query that runs too long is cancelled and
+  reported as an error rather than left to hang.
 
 File objects from `pathlib.Path(...).open()` do **not** support `for line in f:` — that raises
 `TypeError: '_io.TextIOWrapper' object is not iterable`. Always read line-by-line with an explicit
 loop instead:
 ```python
-f = pathlib.Path("/data/<filename>").open()
+f = pathlib.Path("/data-source/<filename>").open()
 while True:
     line = f.readline()
     if not line:

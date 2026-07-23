@@ -89,6 +89,29 @@ class OverflowCapabilityTests(unittest.IsolatedAsyncioTestCase):
             spilled = await capability.store.read(result.metadata["overflow_handle"])
             self.assertGreater(len(spilled), 20_000)
 
+    async def test_data_tools_are_exempt_from_overflow_reduction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            capability = build_overflow_capability(Path(directory) / "logs", "task-a")
+            context = RunContext(
+                deps=None,
+                model=TestModel(),
+                usage=RunUsage(),
+                run_id="run-1",
+            )
+            oversized = {"rows": [{"sni": "x" * 20_000}], "offset": 0, "returned": 1, "has_more": False}
+
+            for tool_name in ("query_events", "aggregate_events"):
+                result = await capability.after_tool_execute(
+                    context,
+                    call=ToolCallPart(tool_name, {}, tool_call_id="call-1"),
+                    tool_def=ToolDefinition(name=tool_name),
+                    args={},
+                    result=oversized,
+                )
+                # Untouched: still the original dict, not a spill-preview string --
+                # sandboxed code calling query_events(...)["rows"] must never see a str here.
+                self.assertIs(result, oversized)
+
     async def test_spill_store_is_task_scoped_and_owner_only(self):
         with tempfile.TemporaryDirectory() as directory:
             logs_dir = Path(directory) / "logs"
@@ -134,6 +157,7 @@ class OverflowAuditTests(unittest.IsolatedAsyncioTestCase):
         expected = {
             "tool_call_id": "call-1",
             "tool_name": "run_code",
+            "duration_ms": None,
             "content": "bounded preview",
             "overflow_handle": "run/call-1.0",
             "overflow_bytes": 24_000_000,

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import yaml
-from pydantic_ai import Agent
+from pydantic_ai import Agent, Tool
 from pydantic_ai.capabilities import Thinking
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.profiles.anthropic import ANTHROPIC_THINKING_BUDGET_MAP
@@ -17,6 +17,7 @@ from pydantic_ai_harness import CodeMode, FileSystem
 from pydantic_ai_harness.memory import FileStore, Memory
 from pydantic_monty import MountDir, OSAccess
 
+from . import data_tools
 from .audit import AuditLog, install_sigterm_handler, restore_sigterm_handler
 from .config import RunOptions, load_model_catalog
 from .resilience import build_overflow_capability, build_provider_hooks
@@ -24,12 +25,13 @@ from .script_lint import lint_and_fix_scripts
 
 SANDBOX_WORKSPACE_MOUNT = "/workspace"
 SANDBOX_SKILL_MOUNT = "/skill"
-SANDBOX_DATA_MOUNT = "/data"
+SANDBOX_DATA_SOURCE_MOUNT = "/data-source"
+SANDBOX_DATA_MOUNT = "/data"  # alias of SANDBOX_DATA_SOURCE_MOUNT, kept for backwards compatibility
 
 # Task IDs are identifiers, not paths -- this rejects path separators, '.'/'..', absolute
 # paths, and filename injection into audit paths. See refs/workspace-lifecycle.md.
 TASK_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
-RESERVED_TASK_NAMES = {"default", "data", "logs", "memory"}
+RESERVED_TASK_NAMES = {"default", "data", "data-source", "data-sink", "logs", "memory"}
 DEFAULT_TASK_ID = "default"
 
 # skill_runner/ is a package one level below the project root -- models.yaml and prompts/
@@ -146,7 +148,8 @@ class WorkspaceContext:
     mode: str
     skill_path: Path
     ws_path: Path
-    data_dir: Path
+    source_root: Path
+    parquet_cache_root: Path
     logs_dir: Path
     memory_dir: Path
     memory_enabled: bool
@@ -171,13 +174,43 @@ class RunSetup:
     options: RunOptions
 
 
+def _require_plain_dir(path: Path, expected_parent: Path, label: str) -> Path:
+    """Require `path` to be a real, non-symlink directory whose resolved parent is exactly
+    `expected_parent` -- never a symlink, never a traversal target."""
+    if path.is_symlink() or not path.is_dir():
+        raise TaskError(f"{label} {path} exists and is not a plain directory")
+    resolved = path.resolve()
+    if resolved.parent != expected_parent:
+        raise TaskError(f"{label} {path} resolves outside its expected parent")
+    return resolved
+
+
+def _select_source_root(base_path: Path) -> Path:
+    """Select the one source root used for the entire run: `data-source/` wins if it
+    already exists; otherwise `data/` is created or reused. Never a union of both --
+    files present only in the non-selected directory are intentionally unavailable."""
+    primary = base_path / "data-source"
+    if primary.exists():
+        return _require_plain_dir(primary, base_path, "source root")
+
+    legacy = base_path / "data"
+    legacy.mkdir(exist_ok=True)
+    return _require_plain_dir(legacy, base_path, "source root")
+
+
 def _prepare_workspace(skill_path: Path, options: RunOptions) -> WorkspaceContext:
     task_id, mode = resolve_task_id(options)
     base_path = options.workspace.resolve()
     base_path.mkdir(parents=True, exist_ok=True)
 
-    data_dir = base_path / "data"
-    data_dir.mkdir(exist_ok=True)
+    source_root = _select_source_root(base_path)
+
+    data_sink_dir = base_path / "data-sink"
+    data_sink_dir.mkdir(exist_ok=True)
+    data_sink_dir = _require_plain_dir(data_sink_dir, base_path, "data-sink root")
+    parquet_cache_root = data_sink_dir / "parquet"
+    parquet_cache_root.mkdir(exist_ok=True)
+    parquet_cache_root = _require_plain_dir(parquet_cache_root, data_sink_dir, "parquet cache root")
 
     logs_dir = base_path / "logs"
     logs_dir.mkdir(exist_ok=True)
@@ -200,7 +233,8 @@ def _prepare_workspace(skill_path: Path, options: RunOptions) -> WorkspaceContex
         mode=mode,
         skill_path=skill_path,
         ws_path=ws_path,
-        data_dir=data_dir,
+        source_root=source_root,
+        parquet_cache_root=parquet_cache_root,
         logs_dir=logs_dir,
         memory_dir=memory_dir,
         memory_enabled=memory_enabled,
@@ -242,6 +276,93 @@ def _build_instructions(skill_path: Path, *, interactive: bool) -> str:
     )
 
 
+def _build_data_tools(context: WorkspaceContext) -> tuple[Tool, Tool, Tool, Tool]:
+    """Bind the data tools to this run's source/cache roots host-side, so the model only ever
+    passes a logical filename -- never a host path. Names are preserved exactly (`query_events`,
+    `aggregate_events`, `describe_events`, `query_sql`) because those strings are what
+    `CodeMode.tools` selects into the sandbox and what the model calls from inside `run_code`.
+
+    Wrapped in `Tool(..., sequential=True)` rather than passed as bare functions: CodeMode
+    renders a `sequential` tool as a plain synchronous callable in the sandbox (`result =
+    query_events(...)`), matching how these are documented and used; without it, every
+    plain-function tool defaults to an async signature requiring `await`.
+    """
+    source_root = context.source_root
+    cache_root = context.parquet_cache_root
+
+    def query_events(
+        name: str,
+        event_type: str | None = None,
+        equals: dict[str, str | int | float | bool | None] | None = None,
+        columns: list[str] | None = None,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> dict[str, object]:
+        """Return a bounded page of parsed events from a source log, identified by its bare
+        filename. Converts the source to a compressed Parquet cache on first use. This is a
+        capped page for inspection, never a statistically complete sample -- use
+        `aggregate_events` for exact whole-dataset counts."""
+        return data_tools.query_events(
+            name,
+            source_root,
+            cache_root,
+            event_type=event_type,
+            equals=equals,
+            columns=columns,
+            offset=offset,
+            limit=limit,
+        )
+
+    def aggregate_events(
+        name: str,
+        event_type: str | None = None,
+        equals: dict[str, str | int | float | bool | None] | None = None,
+        group_by: list[str] | None = None,
+        limit: int = 100,
+    ) -> dict[str, object]:
+        """Compute an exact count, optionally grouped, over the complete filtered dataset --
+        always scans every row regardless of `limit`; `limit` only bounds how many groups are
+        returned. Use this instead of aggregating a `query_events` page."""
+        return data_tools.aggregate_events(
+            name,
+            source_root,
+            cache_root,
+            event_type=event_type,
+            equals=equals,
+            group_by=group_by,
+            limit=limit,
+        )
+
+    def describe_events(
+        name: str,
+        offset: int = 0,
+        limit: int = 100,
+    ) -> dict[str, object]:
+        """Return a bounded page of top-level Parquet column names and dtype descriptions for
+        a source log, identified by its bare filename. Never scans data rows -- call this
+        before authoring a `query_sql` query, since a sampled row may conceal a nested field
+        behind a null `dns`/`tls` struct."""
+        return data_tools.describe_events(name, source_root, cache_root, offset=offset, limit=limit)
+
+    def query_sql(
+        name: str,
+        sql: str,
+        limit: int = 100,
+    ) -> dict[str, object]:
+        """Run one read-only SELECT (or WITH ... SELECT) against a source log's cached Parquet
+        file, identified by its bare filename, exposed as an `events` view. Use this only when
+        `query_events`/`aggregate_events` cannot express the question (nested fields, joins,
+        window/statistical functions) -- see the sandbox notes for when to prefer each."""
+        return data_tools.query_sql(name, source_root, cache_root, sql=sql, limit=limit)
+
+    return (
+        Tool(query_events, sequential=True),
+        Tool(aggregate_events, sequential=True),
+        Tool(describe_events, sequential=True),
+        Tool(query_sql, sequential=True),
+    )
+
+
 def _build_agent(
     context: WorkspaceContext,
     options: RunOptions,
@@ -249,15 +370,17 @@ def _build_agent(
     audit: AuditLog,
     sink: StatusSink,
 ) -> Agent:
+    query_events_tool, aggregate_events_tool, describe_events_tool, query_sql_tool = _build_data_tools(context)
     capabilities: list[Any] = [
         FileSystem(root_dir=str(context.ws_path)),
         CodeMode(
-            tools=[],
+            tools=["describe_events", "query_events", "aggregate_events", "query_sql"],
             max_retries=options.max_retries,
             mount=[
                 MountDir(SANDBOX_WORKSPACE_MOUNT, str(context.ws_path), mode="read-write"),
                 MountDir(SANDBOX_SKILL_MOUNT, str(context.skill_path.resolve()), mode="read-only"),
-                MountDir(SANDBOX_DATA_MOUNT, str(context.data_dir), mode="read-only"),
+                MountDir(SANDBOX_DATA_SOURCE_MOUNT, str(context.source_root), mode="read-only"),
+                MountDir(SANDBOX_DATA_MOUNT, str(context.source_root), mode="read-only"),
             ],
             os_access=OSAccess(environ={}),
         ),
@@ -304,20 +427,22 @@ def _build_agent(
         name=context.skill_path.name,
         system_prompt=instructions,
         capabilities=capabilities,
+        tools=[query_events_tool, aggregate_events_tool, describe_events_tool, query_sql_tool],
         model_settings=model_settings or None,
     )
 
 
 def _build_prompt_prefix(context: WorkspaceContext, sink: StatusSink) -> str:
     prompt_parts: list[str] = []
-    data_files = sorted(path.name for path in context.data_dir.iterdir() if path.is_file())
+    data_files = sorted(path.name for path in context.source_root.iterdir() if path.is_file())
     if data_files:
-        inventory = "\n".join(f"- {SANDBOX_DATA_MOUNT}/{name}" for name in data_files)
+        inventory = "\n".join(f"- {SANDBOX_DATA_SOURCE_MOUNT}/{name}" for name in data_files)
         prompt_parts.append(
-            f"Input files available read-only at {SANDBOX_DATA_MOUNT} (use these exact paths "
-            f"in run_code):\n{inventory}\n\n"
+            f"Input files available read-only at {SANDBOX_DATA_SOURCE_MOUNT} (also aliased at "
+            f"{SANDBOX_DATA_MOUNT}) -- use these exact paths in run_code, or pass the bare "
+            f"filename to query_events/aggregate_events:\n{inventory}\n\n"
         )
-        sink.status(f"Found {len(data_files)} input file(s) in data: {', '.join(data_files)}")
+        sink.status(f"Found {len(data_files)} input file(s) in {context.source_root}: {', '.join(data_files)}")
 
     existing_scripts = sorted(path.name for path in context.ws_path.glob("*.py"))
     if existing_scripts:

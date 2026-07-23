@@ -26,7 +26,9 @@ flowchart TB
         Think["Thinking capability (optional)"]
         Mem["Memory capability\n(accumulate mode only)"]
         TaskWs[("Task workspace\nworkspace/<task>/")]
-        Data[("Input data (read-only)\nworkspace/data/")]
+        Data[("Input data (read-only)\none of workspace/data-source/\nor workspace/data/ (legacy fallback)")]
+        DataSink[("Parquet cache (host-only,\nNOT mounted into Monty)\nworkspace/data-sink/parquet/")]
+        DataTools["query_events() / aggregate_events() /\ndescribe_events() / query_sql()\n(host-side Polars + DuckDB, bound Agent tools,\nselected into run_code by CodeMode)"]
         Logs[("Audit log (host-only)\nworkspace/logs/")]
         Spills[("Oversized tool returns\nworkspace/logs/overflow/<task>/")]
         MemStore[("Memory notebook\nworkspace/memory/<skill>/<task>/")]
@@ -43,13 +45,16 @@ flowchart TB
         Agent --> ProviderHooks
         Agent -.-> Think
         Agent -.-> Mem
+        Agent -- "registered tools\n(sandboxed via CodeMode.tools=[...])" --> DataTools
         FS -- "native calls (task-scoped root)" --> TaskWs
         CM --> Monty
         Overflow -- "spill full value / return preview" --> Spills
         Mem -- "native calls + bounded injection\n(scoped to <skill>/<task>, never mounted)" --> MemStore
         Monty -- "mount /workspace (rw)" --> TaskWs
-        Monty -- "mount /data (ro)" --> Data
+        Monty -- "mount /data-source (ro),\nalias /data (ro)" --> Data
         Monty -- "mount /skill (ro)" --> Skill
+        DataTools -- "logical name -> validated path\n(model never sees a host path)" --> Data
+        DataTools -- "convert on first query, then scan_parquet" --> DataSink
         Agent -- "event_stream_handler:\nmodel text/thinking, tool calls/results" --> Sink
         Session -- "checkpoint / complete" --> Artifacts
         Artifacts -.-> TaskWs
@@ -71,7 +76,23 @@ and dispatch to one of two UI drivers. The application code behind it is divided
   `models.yaml` shape into one `ModelCatalog`.
 - **`run_core.py`** prepares the secure workspace, skill prompt, capabilities, agent, inventory
   prefix, and narrow `RunSetup` handoff. If setup fails after audit creation it writes a failed
-  `run_end`, closes the audit, and restores the previous SIGTERM handler before re-raising.
+  `run_end`, closes the audit, and restores the previous SIGTERM handler before re-raising. It
+  also selects the run's one input source root (`data-source/` if present, else `data/`) and
+  binds the four host-side data tools (see `data_tools.py` below) to that root before building the
+  agent.
+- **`data_tools.py`** implements four host-side helpers for querying large NDJSON logs without
+  loading them into the sandbox: `query_events`/`aggregate_events` (typed filters — `event_type`,
+  bounded top-level `equals`, pagination, grouping) and `describe_events` (bounded Parquet schema,
+  never scans rows) cover the common path; `query_sql` is the escape hatch letting the model
+  author a read-only SQL `SELECT`, executed host-side by DuckDB, for nested `STRUCT`/`LIST`
+  fields, cross-event-type correlation, and window/statistical functions the typed tools can't
+  express (see `SQL_QUERY_PLAN.md`). All four take a logical filename, never a host path.
+  `ensure_parquet_cache` owns all path resolution/traversal defense and the one-time
+  NDJSON→Parquet conversion (locked, atomic, fingerprinted by source identity) behind every call,
+  including `query_sql`'s. `query_sql` layers a second, independent security boundary on top —
+  the DuckDB *connection* itself is locked down (`allowed_paths` scoped to the one cache file,
+  `enable_external_access=false`) before the model's SQL text ever runs, so the constraint is on
+  what the connection can reach, not on parsing the query text for danger.
 - **`session.py`** owns the agent loop, first-turn prompt prefix, transcript, state transitions,
   post-turn lint/artifact policy, errors and interruptions, and final audit closure. UI drivers
   submit prompts but do not mutate the workspace or manage run lifecycle themselves. Also enforces
@@ -167,10 +188,14 @@ Capabilities compose to define what the agent can actually do, each independent 
   `workspace/data/` or `workspace/logs/` or any other task's directory, because its root never
   points above `workspace/<task>/`.
 - **`CodeMode`** — replaces however many tools would otherwise be sandboxed with a single
-  `run_code` tool that accepts Python source. In this system it sandboxes *zero* of the other
-  tools (`FileSystem`'s tools stay native); `run_code` exists purely as a Python execution
-  surface for log analysis, not as a wrapper around other capabilities. This is a deliberate,
-  non-default configuration choice — see `PYDANTIC-STACK.md` §4 for why.
+  `run_code` tool that accepts Python source. `CodeMode.tools` selects exactly four names,
+  `describe_events`, `query_events`, `aggregate_events`, and `query_sql`, into the sandbox as
+  plain synchronous callables; every other tool (`FileSystem`'s tools, `Memory`'s tools) stays
+  native. `run_code` is otherwise a Python execution surface for log analysis, not a wrapper
+  around other capabilities — the four selected names are host-side Polars/DuckDB helpers
+  (`data_tools.py`), not passthroughs to another capability. This selective-not-empty selector is
+  itself a deliberate, non-default configuration choice — see `PYDANTIC-STACK.md` §4 for why
+  `tools='all'` is avoided.
 - **`OverflowingToolOutput`** — intercepts every tool result before it enters model history. At
   10,000 characters it stores the complete value in the task-scoped, owner-only
   `workspace/logs/overflow/<task>/` store and substitutes a bounded preview plus an opaque
@@ -197,25 +222,42 @@ Capabilities compose to define what the agent can actually do, each independent 
 The interpreter behind `run_code`. Structurally, it is the system's actual security boundary:
 a from-scratch Python-subset interpreter (not a subprocess or container) with its own type
 checker, a fixed importable stdlib subset, no class definitions, and no host filesystem/env/clock
-access except what's explicitly granted. Two things are granted, each independently:
+access except what's explicitly granted. Three things are granted, each independently:
 
-- **Mounted directories** — the task workspace (read-write), the case's input data (read-only),
-  and the current skill's own directory (read-only). These are the *only* three paths reachable
-  from inside sandboxed code.
+- **Mounted directories** — the task workspace (read-write), the case's input data (read-only,
+  mounted at both `/data-source` and its `/data` alias), and the current skill's own directory
+  (read-only). These are the *only* paths reachable from inside sandboxed code — `workspace/
+  data-sink/parquet/` (the Parquet cache) is deliberately never mounted; the model can only reach
+  it indirectly through the four data tools.
 - **OS access** — environment variables are scrubbed to empty; the host clock is exposed (needed
   for timestamped filenames).
+- **Four sandboxed function calls** — `describe_events`/`query_events`/`aggregate_events`/
+  `query_sql`, selected into `run_code` by `CodeMode.tools=[...]`. These execute host-side
+  (Polars and DuckDB are never importable inside Monty itself); the sandbox only ever sees their
+  typed arguments (including `query_sql`'s free-text `sql` string) and plain-dict return values,
+  never a host path. `query_sql`'s own connection-level lockdown (`allowed_paths`,
+  `enable_external_access=false` — see `data_tools.py` above) is enforced entirely host-side, one
+  level below what the sandbox interpreter itself restricts.
 
-Everything the sandbox can do is enumerated by these two grants — there is no ambient access to
+Everything the sandbox can do is enumerated by these three grants — there is no ambient access to
 fall back on.
 
 ### Workspace
 
-`--workspace` (default `./workspace`) is the case root, containing four domains — see
+`--workspace` (default `./workspace`) is the case root, containing five domains — see
 [`refs/workspace-lifecycle.md`](refs/workspace-lifecycle.md) for the full design this section
 summarizes:
 
-- **`data/`** — canonical, caller-supplied input evidence. Read-only, shared across tasks
-  (including pristine ones), mounted at `/data`. Not agent state.
+- **`data-source/` (or `data/`, legacy fallback)** — canonical, caller-supplied input evidence.
+  Read-only, shared across tasks (including pristine ones), mounted at `/data-source` and aliased
+  at `/data`. Not agent state. Exactly one of the two is selected for the entire run —
+  `data-source/` wins if it already exists as a real directory, otherwise `data/` is created or
+  reused — never a union of both; see `_select_source_root()` in `run_core.py`.
+- **`data-sink/parquet/`** — host-only Parquet cache shared by all four data tools (including
+  `query_sql`, which exposes it as a lazy DuckDB `VIEW` rather than a second cache), keyed
+  by a fingerprint of each source file's identity (root, name, device/inode, size, mtime).
+  Populated lazily on first query, never mounted into the sandbox, and not agent state — it's a
+  derived cache the model never addresses directly, only through the four data tools.
 - **`<task>/`** — the one stateful, agent-writable directory, and the join point between three
   different views of the same directory: `FileSystem` tools see it as their root (relative
   paths), `run_code` sees it mounted at `/workspace` (read-write), and the host process reads/
@@ -303,29 +345,44 @@ flowchart LR
         H4["writes audit log / report / generated_code"]
         H5["reads workspace/logs/ audit JSONL —\nnever exposed to agent"]
         H6["stores oversized tool results —\nreadable only in bounded handle slices"]
+        H7["4 data tools:\nresolve logical name -> validated path,\nrun Polars/DuckDB, return plain dicts"]
+        H8["data-sink/parquet/ cache —\nnever mounted, no host path\never reaches the model"]
+        H9["query_sql only: per-call DuckDB connection —\nallowed_paths=[cache file], enable_external_access=false\nset BEFORE the model's SQL text ever runs"]
     end
 
     subgraph Sandbox["Monty sandbox — near-zero ambient access"]
-        S1["pathlib reachable ONLY under:\n/workspace (rw, task-scoped) · /data (ro) · /skill (ro)\n(elsewhere: hard error, not silent no-op)"]
+        S1["pathlib reachable ONLY under:\n/workspace (rw, task-scoped) · /data-source + /data alias (ro) · /skill (ro)\n(elsewhere: hard error, not silent no-op)"]
         S2["os.environ = {} — no host secrets"]
         S3["clock passes through (for filenames)"]
-        S4["no sockets, no third-party imports,\nno class definitions, no exec/eval"]
+        S4["no sockets, no third-party imports\n(no polars/duckdb), no class definitions, no exec/eval"]
+        S5["describe_events(...) / query_events(...) /\naggregate_events(...) / query_sql(...) —\nsandboxed function calls, args/return only,\nnever a host path"]
     end
 
     HostProc -- "mount: /workspace (rw, workspace/<task>/)" --> Sandbox
-    HostProc -- "mount: /data (ro, workspace/data/)" --> Sandbox
+    HostProc -- "mount: /data-source + /data alias (ro, selected source root)" --> Sandbox
     HostProc -- "mount: /skill (ro)" --> Sandbox
+    Sandbox -- "typed call, e.g. query_events(name=..., limit=...)\nor free-text query_sql(name=..., sql=...)" --> H7
+    H7 -- "query_sql only" --> H9
+    H7 -- "plain dict/list result" --> S5
 ```
 
 `FileSystem` tool calls never cross into the sandbox at all — they're native calls the model
 issues directly against the host-side task workspace path. `run_code` is the only surface that
-crosses into the sandbox, and everything it can touch is enumerated above. There is no path by
-which model-generated code reaches host secrets, the network, another task's directory,
-`workspace/logs/`, or any file outside the three mounted directories, regardless of what the
-model's own instructions or the user's prompt ask for — the guarantee is structural (interpreter
-+ mount table + task-root validation), not something a skill's wording could accidentally weaken.
-See "Isolation guarantee" in `refs/workspace-lifecycle.md` for the specific invariants this
-depends on (validated task roots, reserved names, no symlink/traversal task ids).
+crosses into the sandbox, and everything it can touch is enumerated above: the mounted
+directories, plus the four selected data-tool function calls, which dispatch to the host and
+return plain data — never a filesystem path into `data-sink/parquet/`. There is no path by which
+model-generated code reaches host secrets, the network, another task's directory,
+`workspace/logs/`, the Parquet cache's internal filenames, or any file outside the mounted
+directories, regardless of what the model's own instructions or the user's prompt ask for — the
+guarantee is structural (interpreter + mount table + task-root validation + `ensure_parquet_cache`'s
+name/containment checks), not something a skill's wording could accidentally weaken. `query_sql`
+adds one more structural guarantee on top, scoped to that one tool: even though its `sql`
+argument is free text chosen entirely by the model, the DuckDB connection it runs against has no
+reachable filesystem or network path except the one allowlisted cache file, set before that text
+is ever executed — so the boundary holds regardless of what the SQL says, not because the text
+was inspected and judged safe. See "Isolation guarantee" in `refs/workspace-lifecycle.md` for the
+specific invariants this depends on (validated task roots, reserved names, no symlink/traversal
+task ids).
 
 `Memory` (when attached) is a second native, non-sandboxed surface alongside `FileSystem` — the
 model reaches `workspace/memory/<skill>/<task>/` only through its own tool calls and automatic
@@ -338,10 +395,11 @@ different mechanism.
 
 - **New skill** = new directory under `skills/`, no runner changes. The runner generalizes over
   skills entirely through the `SKILL.md`/`skill.yaml`/`references/` convention.
-- **New capability** (e.g. a future tool that should be *sandboxed* rather than native) is added
-  to the `capabilities` list and, if it should run inside `run_code`, included in `CodeMode`'s
-  tool selector — today that selector is empty by design, but it accepts a predicate, so a mixed
-  native/sandboxed toolset is a configuration change, not a redesign.
+- **New capability or tool** (e.g. one that should be *sandboxed* rather than native) is added to
+  the `capabilities`/`Agent(tools=[...])` list and, if it should run inside `run_code`, its name
+  added to `CodeMode.tools` alongside the four existing data tools — the selector accepts a
+  list or a predicate, so a mixed native/sandboxed toolset is a configuration change, not a
+  redesign.
 - **New reference material** for a skill is picked up automatically the moment it's added under
   that skill's `references/`, since the read-only mount is keyed off the skill directory as a
   whole, not individual files.

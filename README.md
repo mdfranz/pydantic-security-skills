@@ -15,6 +15,8 @@ threats, suspicious egress, protocol anomalies).
 ## Further reading
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — components, structure, and trust boundaries.
+- [`SQL_QUERY_PLAN.md`](SQL_QUERY_PLAN.md) — technical design plan for host-side model-authored SQL via DuckDB.
+- [`SQL_BOUNDARY_TESTING.md`](SQL_BOUNDARY_TESTING.md) — test matrix and security boundary verification for `query_sql` and the Python sandbox.
 - [`skill_runner/IMPL.md`](skill_runner/IMPL.md) — implementation-level reference for the
   `skill_runner` package: types, functions, control flow, and gotchas.
 - [`PYDANTIC-STACK.md`](PYDANTIC-STACK.md) — how the pydantic-ai/harness/Monty stack is wired
@@ -28,17 +30,29 @@ threats, suspicious egress, protocol anomalies).
 
 - `skill-runner` loads a skill's `SKILL.md` as the agent's instructions.
 - `--workspace` (default `./workspace`) is the **case root**, not the agent's own directory. It
-  has four subtrees: `data/` (canonical input evidence, read-only), one directory per *task*
-  (the agent's writable workspace — see below), `memory/` (per-task notebook, tool-visible only —
-  see below), and `logs/` (host-owned runtime records, never filesystem-visible to the agent).
+  has five subtrees: `data-source/` (canonical input evidence, read-only; `data/` is used instead
+  as a legacy fallback if `data-source/` doesn't exist), `data-sink/parquet/` (a host-only Parquet
+  cache for fast log queries, never mounted into the sandbox), one directory per *task* (the
+  agent's writable workspace — see below), `memory/` (per-task notebook, tool-visible only — see
+  below), and `logs/` (host-owned runtime records, never filesystem-visible to the agent).
 - The agent gets a `FileSystem` capability scoped to the current task's directory
   (`<workspace>/<task>/`, read/write/search files), called natively — `CodeMode` is configured
-  with `tools=[]`, so it doesn't wrap any tool behind `run_code`; `run_code` is purely a sandboxed
-  Python execution surface. Inside it, `pathlib` reaches three mounted directories:
-  `/workspace` (read-write, the same task directory `FileSystem` is scoped to), `/data`
-  (read-only, canonical input evidence shared across tasks), and `/skill` (read-only, the current
-  skill's own directory, for reference material like `references/*.md`). No other host
-  filesystem/env/clock access is available.
+  with `tools=["describe_events", "query_events", "aggregate_events", "query_sql"]`, so only those
+  four host-side data-query helpers are wrapped behind `run_code`; everything else (`FileSystem`,
+  `Memory`) stays native. Inside `run_code`, `pathlib` reaches three mounted directories:
+  `/workspace` (read-write, the same task directory `FileSystem` is scoped to), `/data-source`
+  (read-only, canonical input evidence shared across tasks; also reachable at the `/data` alias),
+  and `/skill` (read-only, the current skill's own directory, for reference material like
+  `references/*.md`). No other host filesystem/env/clock access is available. The four data tools
+  are a fourth, non-filesystem grant: the model passes a bare input filename (never a path) and
+  gets back a bounded row page (`query_events`), an exact aggregate count (`aggregate_events`), a
+  bounded schema page (`describe_events`), or the result of a model-authored read-only SQL
+  `SELECT` (`query_sql`) — all computed host-side over a Parquet cache built from the input log on
+  first use. `query_sql` is the escape hatch for nested fields, cross-event-type correlation, and
+  window/statistical functions the other three can't express; it runs against a locked-down DuckDB
+  connection (`allowed_paths` scoped to the one cache file, external access disabled) so the
+  model's SQL text can't reach anything else on disk or the network — see
+  `prompts/sandbox_notes.md` for the full contract and `SQL_QUERY_PLAN.md` for the security model.
 - In accumulate mode, the agent also gets a `Memory` capability: a persistent `MEMORY.md`
   notebook, auto-injected (bounded) into every request, plus `read_memory`/`write_memory`/
   `search_memory` tools for longer topic files — native, like `FileSystem`, never routed through
@@ -50,8 +64,8 @@ threats, suspicious egress, protocol anomalies).
   `retry_after_seconds` value when supplied.
 - Analysis is native Python + `json` only — Monty permits a fixed stdlib subset (`sys`, `typing`,
   `asyncio`, `math`, `json`, `re`, `datetime`, `os`, `pathlib`), no third-party imports and no class
-  definitions, so DuckDB/Polars/pandas can never run inside the sandbox regardless of what a skill
-  asks for.
+  definitions, so DuckDB/Polars/pandas can never run *inside the sandbox itself* regardless of what
+  a skill asks for — they only ever run host-side, behind the four data tools above.
 
 ### Task-scoped workspaces
 
@@ -61,7 +75,8 @@ design.
 
 - No flags → the shared `default` task (accumulates).
 - `--task <name>` → a named task that accumulates across runs sharing that name. Names must
-  match `[a-z0-9][a-z0-9_-]{0,63}`; `default`, `data`, `logs`, and `memory` are reserved.
+  match `[a-z0-9][a-z0-9_-]{0,63}`; `default`, `data`, `data-source`, `data-sink`, `logs`, and
+  `memory` are reserved.
 - `--pristine` → a fresh, auto-generated (`task-<uuid4>`) task directory with no prior agent
   state — including no `Memory` capability, so a pristine run's tool surface and prompt are
   identical regardless of prior runs. The directory persists after the run for later inspection
@@ -75,7 +90,8 @@ design.
 
 ## Running
 
-Drop your log data into `./workspace/data` (created automatically on first run), then:
+Drop your log data into `./workspace/data-source` (created automatically on first run; an
+existing `./workspace/data` from before this directory existed still works as a fallback), then:
 
 ```bash
 export GEMINI_API_KEY="your-gemini-api-key"

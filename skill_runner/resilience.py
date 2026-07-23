@@ -20,6 +20,18 @@ TOOL_OUTPUT_OVERFLOW_CHARS = 10_000
 TOOL_OUTPUT_PREVIEW_CHARS = 1_000
 TOOL_OUTPUT_FALLBACK_CHARS = 4_000
 
+# query_events/aggregate_events/describe_events/query_sql already bound their own return size
+# (MAX_PAGE_ROWS/MAX_GROUP_ROWS/MAX_SCHEMA_COLUMNS/MAX_SQL_ROWS, has_more/truncated pagination)
+# -- they are dispatched as *nested* tool calls from inside run_code, and this capability's
+# after_tool_execute hook fires on nested calls too (the inner ToolManager shares the outer
+# one's root_capability). Left unexempted, a wide page (e.g. columns=["tls"] rows full of
+# cert/SNI/JA4 strings, or a `query_sql` projection over the same struct) can cross the char
+# threshold well under the row cap, and the spill silently replaces the tool's documented dict
+# return with a preview *string* -- breaking `page["rows"]`/`page["has_more"]` for the
+# sandboxed code with no signal beyond an AttributeError, forcing the model to rediscover a
+# safe `limit` by trial and error instead of trusting the tool's own contract.
+DATA_TOOL_NAMES = frozenset({"query_events", "aggregate_events", "describe_events", "query_sql"})
+
 RateLimitCallback = Callable[[ModelHTTPError, int, float], None]
 
 
@@ -74,7 +86,12 @@ def build_provider_hooks(*, on_retry: RateLimitCallback | None = None) -> Hooks:
 
 
 def build_overflow_capability(logs_dir: Path, task_id: str) -> OverflowingToolOutput:
-    """Spill large tool returns outside model history in an owner-only task store."""
+    """Spill large tool returns outside model history in an owner-only task store.
+
+    Excludes `DATA_TOOL_NAMES`: those tools already bound their own return size and would
+    otherwise have their documented dict contract silently replaced by a spill-preview
+    string when a wide page crosses this capability's char threshold. See `DATA_TOOL_NAMES`.
+    """
     return OverflowingToolOutput(
         bands=[
             Band(
@@ -86,4 +103,5 @@ def build_overflow_capability(logs_dir: Path, task_id: str) -> OverflowingToolOu
             )
         ],
         store=LocalFileStore(base_dir=logs_dir / "overflow" / task_id),
+        tool_filter=lambda ctx, tool_def: tool_def.name not in DATA_TOOL_NAMES,
     )

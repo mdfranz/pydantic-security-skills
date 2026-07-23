@@ -664,3 +664,122 @@ than requiring a monkeypatch or replaying completed tool calls.
 
 **Result:** Textual shutdown has an explicit session transition, and non-default skills no longer
 need a placeholder prompt to open an empty TUI session.
+
+---
+
+### Phase 18: `data-source`/`data-sink` and Host-Side Polars Query Tools (2026-07-22)
+
+**Objective:** Implement `DATA_SOURCE_SINK_PLAN.md` — fast, bounded querying of large input logs
+without loading them whole into the Monty sandbox, and without giving the model SQL or a
+filesystem path into a cache.
+
+- Added `skill_runner/data_tools.py`: `ensure_parquet_cache()` (name/containment validation,
+  source-identity fingerprinting, locked temporary-file conversion, atomic publication) plus
+  `query_events()` (bounded row page with `offset`/`has_more` pagination) and `aggregate_events()`
+  (exact count/group-by counts over the complete filtered dataset, independent of any page limit).
+  All model-controlled arguments (`limit`, `columns`, `group_by`) are bounded by module constants
+  so a tool result can never be unbounded; validation failures raise `DataToolError` (a
+  `ModelRetry` subclass) so the model gets retry feedback instead of a crashed run.
+- `run_core.py` now selects one source root per run — `workspace/data-source/` if it already
+  exists as a real, non-symlink directory, else `workspace/data/` (legacy fallback) — and mounts
+  it at both `/data-source` (primary) and `/data` (alias, same host directory, for backwards
+  compatibility). Added `workspace/data-sink/parquet/` as a host-only cache directory, created but
+  never mounted into the sandbox. `data-source` and `data-sink` joined the reserved task-name set.
+- Wired `query_events`/`aggregate_events` as bound `Tool(..., sequential=True)` objects (host
+  closures over the run's `source_root`/`parquet_cache_root`, registered via `Agent(tools=[...])`)
+  and selected them into the sandbox with `CodeMode(tools=["query_events", "aggregate_events"])` —
+  `sequential=True` was required to get `CodeMode` to render them as plain synchronous callables
+  (`query_events(...)`, no `await`) rather than the `async def` signature a plain function tool
+  gets by default; caught by an integration test before it shipped, not by the plan's pseudocode,
+  which had assumed sync-by-default.
+- Added `polars>=1.0.0` as a direct dependency (host-side only — still uninstallable inside Monty,
+  which has no third-party imports at all); confirmed a cp310-abi3 `polars-runtime-32` wheel
+  covers the project's Python 3.14 pin before committing.
+- Updated `prompts/sandbox_notes.md`, `ARCHITECTURE.md`, `PYDANTIC-STACK.md`, `README.md`,
+  `PKG.md`, and `refs/workspace-lifecycle.md` for the new mount, tool-selector, and trust-boundary
+  shape; the earlier draft of `sandbox_notes.md` (landed in a prior commit alongside the plan
+  itself) had documented `query_events` ahead of its implementation and inaccurately (a plain
+  `list[dict]` return, no `aggregate_events`) — corrected now that both tools actually exist.
+- Added `tests/test_data_tools.py` (22 tests: name/containment validation including symlink and
+  traversal rejection, cache-identity collision avoidance, atomic conversion including a
+  concurrent-caller and a pre-planted-symlink-at-the-cache-path case, page/aggregate query
+  behavior and bounds) and extended `tests/test_run_core.py` with source-root-selection tests plus
+  end-to-end `FunctionModel`-driven integration tests that actually drive `run_code` through the
+  real `CodeMode`/Monty stack (caching reuse, the `/data-source`↔`/data` alias, `aggregate_events`,
+  and a traversal attempt surfacing as a retry rather than a crash) — the sync-vs-async signature
+  bug above was only caught because these exercise the real sandboxed dispatch, not a mock.
+
+**Result:** 49/49 tests pass. Large NDJSON logs get a one-time Parquet conversion and are then
+queryable by bounded page or exact aggregate in well under the time a full in-sandbox scan would
+take, with no SQL surface and no path ever passed by the model into either the source or the
+cache.
+
+---
+
+### Phase 19: Model-Authored SQL via `query_sql`, `describe_events`, and `equals` Filters (2026-07-23)
+
+**Objective:** Implement `SQL_QUERY_PLAN.md` — reverse Phase 18's "no SQL" call for the one class
+of question the typed tools structurally can't reach (nested `STRUCT`/`LIST` fields like
+`tls.sni`/`dns.queries[].rrtype`, cross-event-type correlation, window/statistical functions),
+without reopening the filesystem/network boundary Phase 18 established.
+
+- Added `duckdb>=1.5.5` as a direct, host-side-only dependency (still uninstallable inside Monty).
+  Unlike `polars-runtime-32`'s `abi3` wheel, `duckdb` ships CPython-version-specific wheels — the
+  cp314 wheel was confirmed present before committing, and this needs re-checking on every future
+  Python version bump.
+- Added `query_sql(name, sql, limit)` to `skill_runner/data_tools.py`. Security model is
+  constraining the *connection*, not the query text: `allowed_paths` is set to the one cache
+  file, `temp_directory`/`memory_limit` are set, then `enable_external_access=false` locks the
+  connection down *before* the model's SQL ever runs, and only then is a lazy `VIEW` (never a
+  materialized `TABLE`) registered over that one allowlisted path. An early draft that
+  materialized via `CREATE TABLE ... AS SELECT *` OOM'd at >1GB against the project's own 176MB
+  fixture, purely from eagerly pulling every wide `STRUCT` column regardless of what the query
+  needed — switching to the allowlisted lazy `VIEW` fixed both the OOM and a ~130x slowdown,
+  since DuckDB's own Parquet pushdown then does the same column/predicate pruning Polars already
+  did. `duckdb.extract_statements` rejects anything but exactly one `SELECT`/`WITH ... SELECT`
+  statement as defense in depth (ATTACH/DROP/COPY are already unreachable via the connection lock
+  regardless). A `threading.Timer` calling `con.interrupt()` enforces a wall-clock timeout;
+  results are recursively normalized (structs/lists walked, non-JSON scalars stringified) and
+  duplicate projected column names are rejected rather than silently dropped.
+- Added `describe_events(name, offset, limit)` — bounded, paginated Parquet schema via
+  `collect_schema()`, never scanning rows — so a model can discover a nested field's presence and
+  name before authoring SQL against it (a sampled row's `dns`/`tls` struct can be null and hide
+  the field otherwise).
+- Added a shared `equals: dict[str, str|int|float|bool|None]` exact-match filter (max 10 entries,
+  AND-combined, `None` means `is_null()`, `event_type` rejected inside it to avoid double
+  specification) to both `query_events` and `aggregate_events`, routed through one validator/
+  applier so the two tools' filtering semantics can't drift apart.
+- Wired both new tools into `run_core.py` (`_build_data_tools` now returns four bound
+  `Tool(..., sequential=True)` objects; `CodeMode.tools` and `Agent(tools=[...])` both list all
+  four) and extended `resilience.py`'s `DATA_TOOL_NAMES` overflow exemption to cover them —
+  without it, a wide `query_sql` projection over a `tls`/`dns` struct could cross the spill
+  threshold and have its documented dict contract silently replaced by a preview string.
+- Extended `prompts/sandbox_notes.md` with `describe_events`, `equals` syntax, and a full
+  `query_sql` subsection (fixed `events` view name, single-statement rule, `limit`/`has_more`
+  semantics matching the typed tools, when to prefer it over them).
+- Extended `tests/test_data_tools.py` (equals AND/null/rejection cases for both typed tools;
+  `describe_events` pagination and schema-only guarantee; `query_sql` coverage for CTEs, trailing
+  comments after `;`, multi-statement/non-`SELECT` rejection, single-quoted paths, traversal/
+  exfiltration attempts against `/etc/passwd` and a prefix-sharing sibling cache file — asserting
+  the engine's own `PermissionException`, not a string blocklist — timeout interruption with
+  scratch-directory cleanup, exact aggregates beyond `MAX_SQL_ROWS`, nested `UNNEST` results,
+  timestamp/decimal JSON-serialization, duplicate-column rejection, and a regression guard that a
+  wide-struct group-by stays fast under a tight `memory_limit`) and `tests/test_run_core.py`
+  (`FunctionModel`-driven wiring for `describe_events`, `equals`, and `query_sql` including a
+  traversal attempt surfacing as a retry, not a crash).
+
+**Result:** 77/77 tests pass. The model can now answer nested-field and correlation questions
+(e.g. DNS query-type distribution via `UNNEST`) that previously required pulling raw pages and
+tallying client-side in the sandbox, in one bounded call — with the filesystem/network boundary
+enforced by the DuckDB connection itself rather than by inspecting the query text.
+
+---
+
+### Phase 20: Audit Log Latency Tracking (`duration_ms`) (2026-07-23)
+
+**Objective:** Add `duration_ms` tracking to `tool_result` / `run_code_return` audit log events.
+
+- Updated `make_event_stream_handler` in `skill_runner/audit.py` to record monotonic start times (`time.monotonic()`) keyed by `tool_call_id` on `FunctionToolCallEvent`, and calculate execution duration (`duration_ms`, rounded to 2 decimal places) when emitting `FunctionToolResultEvent`.
+- Updated `tests/test_resilience.py` and added `EventStreamHandlerTests` to `tests/test_audit.py` to assert accurate `duration_ms` emission for tool execution audit logs.
+- Created `SQL_BOUNDARY_TESTING.md` detailing the adversarial test matrix and security boundary verification specification for the `query_sql` interface and Python sandbox.
+

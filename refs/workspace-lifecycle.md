@@ -37,7 +37,8 @@ Every file belongs to one of four domains, which decides whether and how the age
 
 | Artifact | Domain | Written by | Location | Agent-visible? |
 |---|---|---|---|---|
-| Caller-supplied evidence such as `eve.json` | Input | Operator, before the run | `workspace/data/` | yes — `/data`, read-only |
+| Caller-supplied evidence such as `eve.json` | Input | Operator, before the run | `workspace/data-source/` (or `workspace/data/`, legacy fallback — exactly one is selected for the whole run) | yes — `/data-source`, aliased at `/data`, read-only; also indirectly via `query_events`/`aggregate_events` (by logical filename, never a path) |
+| Host-side Parquet cache for `query_events`/`aggregate_events` | Host (derived) | The runner, lazily on first query | `workspace/data-sink/parquet/` | **no** — never mounted; reachable only through the two data tools' return values, never by path |
 | Reusable `<prefix>_*.py` scripts | Agent | The agent itself, via `FileSystem.write_file` mid-run | `workspace/<task>/` | yes — the runner injects a listing of these into the next run's prompt, unconditionally |
 | `analyst_log-*.md` analysis reports | Agent | The runner, assembled from the completed conversation *after* the run ends | `workspace/<task>/` | yes, but only if the agent finds it — reachable via `list_directory`/`read_file`, never injected into the prompt |
 | `generated_code/*.py` (run_code copies) | Agent | The runner, one file per `run_code` call, written *after* the run ends | `workspace/<task>/` | yes, but only if the agent finds it — same as above; this is an unconditional capture of every `run_code` call regardless of success, not something the agent chose to save |
@@ -46,8 +47,14 @@ Every file belongs to one of four domains, which decides whether and how the age
 | Oversized tool return | Host | `OverflowingToolOutput`, before model history | `workspace/logs/overflow/<task>/<run-id>/` | only in bounded slices through an opaque `read_tool_result` handle; never through the filesystem |
 
 **Input domain** = canonical source evidence supplied by the operator. It lives in
-`workspace/data/`; the runner mounts it at `/data` read-only. It is intentionally shared between
+`workspace/data-source/` if that directory already exists as a real, non-symlink directory,
+otherwise in `workspace/data/` (created/reused as the fallback) — selected once at startup, never
+a union of both. The runner mounts the selected directory at `/data-source`, with `/data` as an
+alias of the same host directory for backwards compatibility. It is intentionally shared between
 tasks, including pristine tasks, but it is not prior agent state. The agent must never modify it.
+A derived, host-only cache of this domain (`workspace/data-sink/parquet/`) backs the
+`query_events`/`aggregate_events` tools — see "A sixth, non-filesystem access point" below; it is
+not itself part of the Input domain's visibility story since the agent never addresses it by path.
 
 **Agent domain** = everything produced during or about a task run that the agent may consume
 later — not necessarily everything the agent itself writes. Only the reusable scripts are
@@ -112,16 +119,16 @@ The task name is resolved once at startup:
 - **Pristine starts with no prior agent state.** A full UUID4 is generated and its directory is
   created exclusively, retrying on the vanishingly unlikely collision. It contains no prior
   scripts, reports, generated code, or task-local outputs. It can still read the intentional,
-  read-only evidence in `/data`. The `Memory` capability itself is omitted for the run (not
+  read-only evidence in `/data-source` (aliased at `/data`). The `Memory` capability itself is omitted for the run (not
   merely pointed at an empty scope), so pristine never carries memory-tool overhead into the
   prompt or tool surface either.
 
 ### Task-id rules
 
 Task IDs are identifiers, **not paths**. A user-supplied `--task` must be a single portable slug
-matching `[a-z0-9][a-z0-9_-]{0,63}`. `default`, `data`, and `logs` are reserved. This rejects
-path separators, `.` and `..`, absolute paths, control characters, Unicode-normalization
-collisions, and filename injection into audit paths.
+matching `[a-z0-9][a-z0-9_-]{0,63}`. `default`, `data`, `data-source`, `data-sink`, `memory`, and
+`logs` are reserved. This rejects path separators, `.` and `..`, absolute paths, control
+characters, Unicode-normalization collisions, and filename injection into audit paths.
 
 ## Isolation guarantee
 
@@ -132,11 +139,16 @@ The agent touches the filesystem through four access points, and none of them ca
   traverse above their root.
 - `MountDir("/workspace", workspace/<task>, read-write)` — the sandbox's `pathlib` can reach this
   writable mount, scoped to the task subdir.
-- `MountDir("/data", workspace/data/, read-only)` — sandboxed code can read canonical evidence,
-  but cannot change it. The FileSystem capability remains rooted at the task workspace and cannot
-  reach `/data`.
+- `MountDir("/data-source", <selected source root>, read-only)` and `MountDir("/data", <same
+  source root>, read-only)` — the same host directory mounted under two virtual paths; sandboxed
+  code can read canonical evidence, but cannot change it. The FileSystem capability remains rooted
+  at the task workspace and cannot reach either.
 - `MountDir("/skill", skills/<name>/, read-only)` — a read-only mount of the current skill dir,
   which lives outside `workspace/` entirely, so it can never expose anything under `workspace/`.
+
+**`workspace/data-sink/parquet/` is deliberately not on this list.** It is never mounted into the
+sandbox and never rooted by `FileSystem`; the only way to reach the data it holds is the sixth
+access point below, which returns parsed values, never a filesystem path into the cache.
 
 **A fifth, non-filesystem access point: the `Memory` capability.** When enabled (accumulate mode
 only — see below), the agent additionally reaches `workspace/memory/<skill>/<task>/` through the
@@ -156,12 +168,23 @@ browse a host path, escape that task's spill root, or receive more than the tool
 and character caps in one call. This is deliberate content access to a specific tool result, not
 filesystem access to `workspace/logs/`.
 
-The two writable workspace-side access points are scoped to `workspace/<task>/`; `/data` grants
-only read access to the dedicated input directory; and the skill mount is outside `workspace/`
-altogether. Thus anything else under `workspace/`, including audit JSONL, the spill directory as
-a filesystem, and every other task directory, is unreachable through those surfaces. The bounded
-spill read-back channel above is the sole deliberate exception for spill contents. Four
-conditions keep the filesystem guarantee true:
+**A sixth, non-filesystem access point: `query_events`/`aggregate_events`.** Two sandboxed
+function calls (selected into `run_code` by `CodeMode.tools`), bound host-side to this run's
+selected source root and `workspace/data-sink/parquet/`. The model passes a logical filename and
+typed filters — never a path — and `ensure_parquet_cache()` (`skill_runner/data_tools.py`) does
+all path resolution: it rejects anything but a bare filename, rejects symlinks, and requires the
+resolved file's parent to equal the resolved source root exactly, so there is no traversal out of
+the selected source root and no way to address the Parquet cache's internal, fingerprinted
+filenames directly. Results are plain dicts (rows or counts), never a filesystem path back into
+`data-sink/`.
+
+The two writable workspace-side access points are scoped to `workspace/<task>/`; `/data-source`
+(and its `/data` alias) grant only read access to the selected input directory; and the skill
+mount is outside `workspace/` altogether. Thus anything else under `workspace/`, including audit
+JSONL, the spill directory as a filesystem, `data-sink/`, and every other task directory, is
+unreachable through those surfaces. The bounded spill read-back channel and the data tools above
+are the sole deliberate exceptions, and both return content, never a host path. Four conditions
+keep the filesystem guarantee true:
 
 1. **The root and mount must stay the task subdir.** The entire guarantee is "agent root =
    `workspace/<task>/`." If either is ever pointed at the `workspace/` base, `logs/` leaks. This
@@ -175,15 +198,19 @@ conditions keep the filesystem guarantee true:
    (`analyst_log-*.md`, `generated_code/`). The filesystem tool correctly rejects traversal
    *below* its root, but cannot make an unsafe root safe — and the host-side `Path.write_text()`
    calls get no such protection at all, so they depend entirely on this upstream validation.
-4. **`data`, `logs`, `memory`, and `default` are reserved task names.** They are siblings of task
-   dirs and must never be selected as a task root.
+4. **`data`, `data-source`, `data-sink`, `logs`, `memory`, and `default` are reserved task
+   names.** They are siblings of task dirs and must never be selected as a task root.
 
 ## Directory layout
 
 ```
 workspace/                                # base (--workspace, default ./workspace)
-  data/                                   # caller-managed, read-only evidence
+  data-source/                            # caller-managed, read-only evidence (primary; wins if present)
     eve.json
+  data/                                   # legacy fallback, only selected if data-source/ absent
+  data-sink/
+    parquet/                              # host-only Parquet cache; NOT mounted, NOT agent-visible
+      <sha256-fingerprint>.parquet
   default/                                # no flag → accumulate here   ← agent-visible
     suricata_extract_sni.py               # reusable agent scripts
     analyst_log-25-07-18_...md            # prior analyses (agent can re-read)
@@ -351,7 +378,8 @@ error: task names must match [a-z0-9][a-z0-9_-]{0,63}
 ```
 
 The invariant across all of these: the agent can write only one `workspace/<task>/` subtree,
-read canonical evidence only through `/data`, and never reach `workspace/logs/` or another task.
+read canonical evidence only through `/data-source` (aliased at `/data`), and never reach
+`workspace/logs/` or another task.
 
 ## Runner changes
 
@@ -366,7 +394,9 @@ discovery. No change to Monty's execution model is required.
   User task names must match the task-id rule; reserve `default`, `data`, `logs`, and `memory`.
 - **Path derivation:**
   - `ws_path = <workspace-base>/<task_id>`  (mounted + `FileSystem` root, as today)
-  - `data_dir = <workspace-base>/data`  (mounted at `/data`, read-only)
+  - `source_root = <workspace-base>/data-source` if it already exists as a real directory, else
+    `<workspace-base>/data`  (mounted at `/data-source`, aliased at `/data`, both read-only)
+  - `parquet_cache_root = <workspace-base>/data-sink/parquet`  (created once; never mounted)
   - `logs_dir = <workspace-base>/logs`  (flat; created once)
   - `memory_dir = <workspace-base>/memory`  (flat; created once; never mounted)
 - **Validate paths before mounting:** resolve the base once, ensure the selected task root is a
@@ -388,8 +418,9 @@ discovery. No change to Monty's execution model is required.
   `run_id` as run metadata/span attributes. Agent name is a logging identity, not a workspace
   binding, and task-specific names create unhelpful high-cardinality telemetry.
 - **Input discovery:** update shared sandbox notes and skills: input files are listed by the
-  runner from `data_dir` at startup and read in `run_code` as `/data/<filename>`; all agent
-  outputs continue to use `/workspace`.
+  runner from `source_root` at startup and read in `run_code` as `/data-source/<filename>` (also
+  reachable at `/data/<filename>`), or passed by bare filename to `query_events`/
+  `aggregate_events`; all agent outputs continue to use `/workspace`.
 - **Memory:** attach `pydantic_ai_harness.memory.Memory(store=FileStore(str(memory_dir)),
   namespace=skill_path.name, agent_name=task_id)` to `capabilities` in accumulate mode, scoping
   the notebook to `<skill>/<task_id>` — the same boundary that already governs script/analyst-log
@@ -403,12 +434,14 @@ discovery. No change to Monty's execution model is required.
 ### Behavior change to confirm
 
 `--workspace` changes meaning from "the agent workspace directory" to "the workspace
-**base/case root**." Its default layout is now `./workspace/data`, `./workspace/default`,
-`./workspace/memory`, and `./workspace/logs`; the agent's writable root is `./workspace/default`.
-Anyone currently passing `--workspace ./foo` will now get `./foo/data`, `./foo/default`,
-`./foo/memory`, and `./foo/logs`. This is an intentional breaking layout change. No automatic
-migration is planned; legacy contents are left untouched and operators place current evidence
-under `data/`.
+**base/case root**." Its default layout is now `./workspace/data-source` (or `./workspace/data`,
+legacy fallback), `./workspace/data-sink/parquet`, `./workspace/default`, `./workspace/memory`,
+and `./workspace/logs`; the agent's writable root is `./workspace/default`. Anyone currently
+passing `--workspace ./foo` will now get `./foo/data-source` (or `./foo/data`), `./foo/data-sink`,
+`./foo/default`, `./foo/memory`, and `./foo/logs`. This is an intentional breaking layout change.
+No automatic migration is planned; legacy contents are left untouched — an existing `data/`
+directory keeps working as the fallback source root, and operators may migrate to `data-source/`
+at their own pace since the runner never merges the two.
 
 ## Open items
 

@@ -9,7 +9,7 @@ import importlib.util
 from .audit import RunInterrupted, map_run_interrupted_exit_code
 from .config import RunOptions, load_model_catalog
 from .console_ui import run_console
-from .run_core import PROJECT_ROOT, TASK_ID_RE, TaskError
+from .run_core import PROJECT_ROOT, RESERVED_TASK_NAMES, TASK_ID_RE, TaskError
 
 DEFAULT_SKILL_DIR = "skills/suricata-analyst"
 
@@ -46,16 +46,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--workspace",
         default="./workspace",
-        help="Workspace base/case root. Contains data/ (read-only input), logs/ (host audit, "
+        help="Workspace base/case root. Contains data-source/ (read-only input; data/ is used "
+        "instead as a legacy fallback if data-source/ doesn't exist), data-sink/parquet/ (host-only "
+        "Parquet cache for query_events/aggregate_events, never agent-visible), logs/ (host audit, "
         "not agent-visible), memory/ (per-task notebook, reachable only via the memory tools, "
         "never through FileSystem), and one subdirectory per task (the agent's writable root).",
     )
     task_group = parser.add_mutually_exclusive_group()
+    reserved_names = ", ".join(f"'{name}'" for name in sorted(RESERVED_TASK_NAMES))
     task_group.add_argument(
         "--task",
         default=None,
         help="Reuse (or create) a named task workspace -- accumulates across runs. Must match "
-        f"{TASK_ID_RE.pattern}; 'default', 'data', 'logs', and 'memory' are reserved. Defaults "
+        f"{TASK_ID_RE.pattern}; {reserved_names} are reserved. Defaults "
         "to the shared 'default' task if neither --task nor --pristine is given.",
     )
     task_group.add_argument(

@@ -1,14 +1,15 @@
 # Technical Implementation Plan: Model-Authored SQL via `query_sql`
 
-This document details adding a third host-side data tool, `query_sql`, alongside the existing
-`query_events`/`aggregate_events` (see `DATA_SOURCE_SINK_PLAN.md`). Unlike those two, `query_sql`
-lets the model author the query itself, as SQL text, executed host-side by DuckDB against the
-same Parquet cache. This directly reverses `DATA_SOURCE_SINK_PLAN.md`'s original "no SQL, no
-model-authored query language" principle — that call was made before the typed tools had been
-exercised against real nested Suricata JSON (`tls.sni`, `dns.queries[].rrtype`), and in practice
-those nested fields are exactly what the flat, top-level-only `group_by`/`columns` validation in
-`query_events`/`aggregate_events` cannot reach without pulling raw pages and iterating client-side
-in the sandbox — the friction that motivated this plan.
+This document details adding a third host-side query tool, `query_sql`, alongside the existing
+`query_events`/`aggregate_events`, plus a bounded `describe_events` schema helper and exact-match
+filters for the two existing Polars tools (see `DATA_SOURCE_SINK_PLAN.md`). Unlike the typed
+tools, `query_sql` lets the model author the query itself, as SQL text, executed host-side by
+DuckDB against the same Parquet cache. This directly reverses `DATA_SOURCE_SINK_PLAN.md`'s
+original "no SQL, no model-authored query language" principle — that call was made before the
+typed tools had been exercised against real nested Suricata JSON (`tls.sni`,
+`dns.queries[].rrtype`), and in practice those nested fields are exactly what the flat,
+top-level-only typed tools cannot reach without pulling raw pages and iterating client-side in
+the sandbox — the friction that motivated this plan.
 
 The security posture changes accordingly: instead of forbidding a query language, this plan
 constrains the *engine connection* the query language runs against, using DuckDB's own documented
@@ -31,10 +32,10 @@ what's actually still true after the fix, not a stale number.
 is a simple filter, a single-field browse, or a group-by over a top-level column
 (`event_type`, `src_ip`, `dest_port`, `proto`, ...):
 - **Cannot express an expensive query.** The parameter surface is a small, enumerable set
-  (`name`, `event_type`, `columns`, `offset`/`limit`, `group_by`) — there is no way to
-  accidentally write a slow cross join or an unbounded aggregation through it, unlike `query_sql`
-  where a `timeout`/`memory_limit` backstop is needed precisely because the query shape is
-  unconstrained (§2).
+  (`name`, `event_type`, bounded top-level `equals`, `columns`, `offset`/`limit`, `group_by`) —
+  there is no way to accidentally write a slow cross join or an unbounded aggregation through
+  it, unlike `query_sql` where a `timeout`/`memory_limit` backstop is needed precisely because the
+  query shape is unconstrained (§2).
 - **Trivially auditable.** `aggregate_events(group_by=["event_type"])` says exactly what it
   touched in one audit-log line. `query_sql(sql="...")` requires reading the actual query text to
   know its blast radius — still safe (§2), just not a one-glance read the way a fixed parameter
@@ -63,9 +64,37 @@ more convenient:
   `HAVING` clauses, multi-level `GROUP BY` combinations that would otherwise mean extending
   `aggregate_events`'s parameter surface indefinitely for every combination a skill might want.
 
-In short: typed tools are the fast, foolproof common path; `query_sql` is the escape hatch for
-exploratory or structurally nested/correlated analysis that would otherwise force the model back
-into slow, error-prone client-side Python over raw pages.
+In short: typed tools are the fast, foolproof common path; `describe_events` makes their schema
+discoverable; `query_sql` is the escape hatch for exploratory or structurally nested/correlated
+analysis that would otherwise force the model back into slow, error-prone client-side Python
+over raw pages.
+
+### Companion improvements to the typed path
+
+Two narrow additions close common-path gaps without recreating SQL through an expanding parameter
+language:
+
+1. **`describe_events(name, offset=0, limit=100)`** returns bounded Parquet schema metadata as
+   `{"columns": [{"name": ..., "dtype": ...}, ...], "offset": ..., "returned": ...,
+   "has_more": ...}`. It uses `pl.scan_parquet(path).collect_schema()` and never scans data rows.
+   Schema discovery is important before authoring SQL because a sampled row may contain a null
+   `dns`/`tls` struct and therefore conceal its nested fields. `offset` must be non-negative and
+   `limit` is capped at `MAX_SCHEMA_COLUMNS`; names and dtype strings are host-derived, never
+   model-authored.
+2. **Top-level exact-match filters on both existing tools.** Add
+   `equals: dict[str, str | int | float | bool | None] | None = None` to `query_events` and
+   `aggregate_events`. Entries are combined with AND and applied before projection/grouping;
+   `None` means `is_null()`. Cap the mapping at `MAX_EQUAL_FILTERS`, validate every key with the
+   existing top-level field-name rules, and accept only the declared scalar values. Preserve the
+   dedicated `event_type` argument for compatibility and reject `event_type` inside `equals` so
+   there is no ambiguous double specification. This covers routine IP, port, protocol, flow-ID,
+   and boolean lookups while remaining cheap, typed, and one-line auditable.
+
+Deliberately do **not** add typed wrappers or parameters for sorting, range predicates, `IN`,
+histograms, time buckets, nested paths, arbitrary expressions, joins, or statistics in this
+change. `aggregate_events(group_by=[...])` already supplies distinct/top-frequency values; the
+remaining operations belong in `query_sql` unless repeated real investigations establish another
+narrow common path.
 
 ---
 
@@ -249,17 +278,56 @@ dependencies = [
 > wheels. A cp314 wheel exists today (verified in §2's table) — re-verify on every Python version
 > bump, since there is no abi3 safety net here.
 
-### B. `skill_runner/data_tools.py` — new function
+### B. `skill_runner/data_tools.py` — typed-tool enhancements and new functions
 
-Added alongside `query_events`/`aggregate_events`, reusing `ensure_parquet_cache` unchanged (same
-name validation, same containment defense, same fingerprinted cache — `query_sql` never adds a
-second cache or a second path-resolution path):
+Add the following bounds alongside the existing constants:
 
 ```python
-MAX_SQL_ROWS = 500                  # mirrors MAX_PAGE_ROWS
+MAX_SCHEMA_COLUMNS = 500
+MAX_EQUAL_FILTERS = 10
+MAX_SQL_ROWS = 500                   # mirrors MAX_PAGE_ROWS
 SQL_QUERY_TIMEOUT_SECONDS = 10
 SQL_MEMORY_LIMIT = "512MB"
+```
 
+Add `equals` to both existing tools and route it through one shared validator/expression builder
+so their filtering semantics cannot drift:
+
+```python
+def query_events(
+    ...,
+    event_type: str | None = None,
+    equals: dict[str, str | int | float | bool | None] | None = None,
+    ...
+) -> dict[str, object]: ...
+
+def aggregate_events(
+    ...,
+    event_type: str | None = None,
+    equals: dict[str, str | int | float | bool | None] | None = None,
+    ...
+) -> dict[str, object]: ...
+```
+
+Add the bounded schema helper, reusing `ensure_parquet_cache` and returning string dtype
+representations so the result remains a plain serializable dict:
+
+```python
+def describe_events(
+    name: str,
+    source_root: Path,
+    cache_root: Path,
+    offset: int = 0,
+    limit: int = 100,
+) -> dict[str, object]:
+    """Return a bounded page of top-level Parquet column names and dtype descriptions."""
+```
+
+Finally, add `query_sql` alongside all three typed helpers, reusing `ensure_parquet_cache`
+unchanged (same name validation, same containment defense, same fingerprinted cache —
+`query_sql` never adds a second cache or a second path-resolution path):
+
+```python
 def query_sql(
     name: str,
     source_root: Path,
@@ -289,32 +357,34 @@ names are a validation error rather than a lossy dict conversion.
 
 ### C. `skill_runner/run_core.py` — wiring
 
-1. `_build_data_tools()` gains a third bound `Tool(query_sql, sequential=True)`, added to both the
-   `Agent(tools=[...])` list and `CodeMode(tools=["query_events", "aggregate_events",
-   "query_sql"])`. **Reuse `sequential=True`** — this project already hit the bug where a plain
-   function tool renders as `async def` (requiring `await`) by default inside `run_code`; the fix
-   for `query_events`/`aggregate_events` was `Tool(..., sequential=True)`, and skipping it here
-   would reintroduce the exact same failure mode for a third tool.
+1. The existing bound `query_events`/`aggregate_events` closures expose their new `equals`
+   argument. `_build_data_tools()` also gains bound `Tool(describe_events, sequential=True)` and
+   `Tool(query_sql, sequential=True)` objects, added to both the `Agent(tools=[...])` list and
+   `CodeMode(tools=["describe_events", "query_events", "aggregate_events", "query_sql"])`.
+   **Reuse `sequential=True`** — this project already hit the bug where a plain function tool
+   renders as `async def` (requiring `await`) by default inside `run_code`; the fix for
+   `query_events`/`aggregate_events` was `Tool(..., sequential=True)`, and skipping it for either
+   new helper would reintroduce the exact same failure mode.
 2. No new mounts, no new reserved names, no change to source-root selection — `query_sql` reuses
    `context.source_root`/`context.parquet_cache_root` exactly as the other two tools do.
 
 ### D. `skill_runner/resilience.py`
 
-Add `"query_sql"` to `DATA_TOOL_NAMES` (the `OverflowingToolOutput` exemption set added for
-`query_events`/`aggregate_events` — see `PROJECT.md`'s account of that fix). `query_sql` has the
-same nested-tool-call exposure to `after_tool_execute` interception and the same
-own-bounded-contract argument for exemption; without this it would fail identically (a `dict` →
-`str` spill substitution silently breaking `page["rows"]` for wide result sets).
+Add `"describe_events"` and `"query_sql"` to `DATA_TOOL_NAMES` (the `OverflowingToolOutput`
+exemption set added for `query_events`/`aggregate_events` — see `PROJECT.md`'s account of that
+fix). Both have bounded return contracts and the same nested-tool-call exposure to
+`after_tool_execute` interception; without the exemption an oversized dict could be replaced by
+a spill-path string and silently break sandbox code expecting the documented result shape.
 
 ### E. `prompts/sandbox_notes.md`
 
-New subsection alongside "Fast Input Queries", documenting: the fixed `events` view name per
+Extend "Fast Input Queries" with `describe_events`, `equals` syntax/AND/null semantics, and the
+typed-vs-SQL guidance from §1. Add a SQL subsection documenting: the fixed `events` view name per
 `name=`; that only one `SELECT`/`WITH ... SELECT` statement is accepted (no DDL, no multiple
 statements, no `ATTACH`/`COPY`/`PRAGMA`); that aggregates are exact over the complete file (the
 query runs against the full `events` view regardless of `limit` — `query_sql`'s boundedness is
 only on *returned* rows via `has_more`, unlike `query_events`'s page, which is explicitly not a
-complete sample); the `limit`/`MAX_SQL_ROWS` cap; and the §1 guidance on when to prefer this over
-the typed tools.
+complete sample); the `limit`/`MAX_SQL_ROWS` cap; and when to prefer it over the typed tools.
 Per the sequencing constraint already established for `sandbox_notes.md`
 (`DATA_SOURCE_SINK_PLAN.md` §4D), this text must land in the same change as §3B/§3C, never ahead
 of them.
@@ -344,6 +414,13 @@ of them.
 Per project convention, tests assert **behavior**, not implementation details of DuckDB itself.
 
 1. **Unit Tests (`tests/test_data_tools.py` additions):**
+   - `describe_events` returns bounded, paginated column names and dtype strings from a fixture
+     containing flat and nested columns without collecting rows; invalid offsets/limits are
+     rejected.
+   - `query_events` and `aggregate_events` apply multiple top-level equality filters with AND
+     semantics over strings, numbers, booleans, and nulls. Both reject unknown/invalid fields,
+     unsupported values, more than `MAX_EQUAL_FILTERS`, and `event_type` duplicated through
+     `equals`; aggregate counts remain exact over the complete filtered input.
    - Single-`SELECT` queries against a small fixture Parquet-backed `events` view return
      correctly shaped `{"columns", "rows", "returned", "has_more"}`.
    - A valid query ending in `; -- trailing comment` is accepted and bounded correctly, guarding
@@ -381,10 +458,10 @@ Per project convention, tests assert **behavior**, not implementation details of
      quickly and without approaching `SQL_MEMORY_LIMIT` — asserting the fix (lazy view +
      `allowed_paths`) rather than re-introducing eager `SELECT *` materialization.
 2. **Integration Test (`tests/test_run_core.py` additions):**
-   - Extend the existing `FunctionModel`-driven `DataToolsWiringTests` with a `query_sql` case:
-     drive `run_code` with a `query_sql(...)` call (sync, no `await` — catching the same
-     sequential-signature regression class caught for the other two tools) and assert a correctly
-     shaped result reaches the model.
+   - Extend the existing `FunctionModel`-driven `DataToolsWiringTests` with `describe_events`,
+     filtered `query_events`/`aggregate_events`, and `query_sql` cases. Drive `run_code` with
+     synchronous calls (no `await` — catching the same sequential-signature regression class
+     caught for the original tools) and assert correctly shaped results reach the model.
    - A `query_sql` call containing a traversal/exfiltration attempt (per the unit test above)
      surfaces as a retry the run recovers from, not a crash — mirroring
      `test_query_events_traversal_attempt_is_retried_not_crashed`.

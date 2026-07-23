@@ -112,10 +112,12 @@ under two different views; `/skill` only exists from inside `run_code`.
 
 ```python
 CodeMode(
-    tools=[],
+    tools=["describe_events", "query_events", "aggregate_events", "query_sql"],
     mount=[
         MountDir(SANDBOX_WORKSPACE_MOUNT, str(ws_path), mode="read-write"),
         MountDir(SANDBOX_SKILL_MOUNT, str(skill_path.resolve()), mode="read-only"),
+        MountDir(SANDBOX_DATA_SOURCE_MOUNT, str(source_root), mode="read-only"),
+        MountDir(SANDBOX_DATA_MOUNT, str(source_root), mode="read-only"),
     ],
     os_access=OSAccess(environ={}),
 )
@@ -124,10 +126,10 @@ CodeMode(
 This is the core of the design, and the piece most worth understanding in detail. `CodeMode`
 replaces however many tools an agent has with a single `run_code` tool: instead of the model
 picking a tool and filling in a JSON args schema, it **writes Python code** that calls the
-capability's chosen tools as plain functions (`await some_tool(arg=...)`), and that code runs
+capability's chosen tools as plain functions (`some_tool(arg=...)`), and that code runs
 inside `Monty` rather than the host Python process.
 
-### `tools=[]` — which tools get sandboxed
+### `tools=[...]` — which tools get sandboxed
 
 `CodeMode.tools` (a.k.a. the *tool selector*) decides which of the agent's tools become
 sandboxed callables inside `run_code`, versus staying as ordinary native tool calls the model
@@ -136,19 +138,29 @@ issues directly. It accepts:
 - a list of tool names — only those,
 - a predicate callable — computed per-tool.
 
-This project sets it to `[]` (an empty list) — **nothing** is sandboxed. Both `FileSystem`'s
-tools (`list_directory`, `read_file`, `write_file`) and any future non-`FileSystem` tools stay
-as native top-level tool calls; `run_code` exists purely as a Python execution surface for the
-model to process log data, not as a wrapper around other tools.
+This project sets it to the four-name list `["describe_events", "query_events",
+"aggregate_events", "query_sql"]` — exactly those four are sandboxed. `FileSystem`'s tools
+(`list_directory`, `read_file`, `write_file`) and `Memory`'s tools stay as native top-level tool
+calls; `run_code` is otherwise a Python execution surface for the model to process log data, not
+a general wrapper around other tools. The four sandboxed names are `data_tools.describe_events`/
+`data_tools.query_events`/`data_tools.aggregate_events`/`data_tools.query_sql` (`skill_runner/
+data_tools.py`), bound to this run's source/cache roots by small wrapper functions in
+`_build_data_tools()` (`skill_runner/run_core.py`) and registered as `Tool(..., sequential=True)`
+on the `Agent` itself — `sequential=True` is what makes `CodeMode` render them as plain `def`
+callables (`result = query_events(...)`) rather than the `async def` signature every other
+plain-function tool gets by default.
 
-This wasn't the original configuration — it defaulted to `'all'`, which silently broke an
-explicit instruction in `SKILL.md` ("call `list_directory(path='.')` ... the FileSystem tool, not
-`run_code`"): with `tools='all'`, `list_directory` was *only* reachable from inside a `run_code`
-call, so the model had to burn a full sandbox round-trip (write Python, `await
+This selector wasn't always non-empty — it originally defaulted to `'all'`, which silently broke
+an explicit instruction in `SKILL.md` ("call `list_directory(path='.')` ... the FileSystem tool,
+not `run_code`"): with `tools='all'`, `list_directory` was *only* reachable from inside a
+`run_code` call, so the model had to burn a full sandbox round-trip (write Python, `await
 list_directory(...)`, get the result back) just to see what files existed. Confirmed via Logfire
 traces before/after — pre-fix, `execute_tool list_directory` was a **child span of
-`execute_tool run_code`**; post-fix, it's a sibling, directly under the agent-run span. See the
-commit that introduced `tools=[]` for the full before/after.
+`execute_tool run_code`**; post-fix, it's a sibling, directly under the agent-run span. It was
+then set to `[]` (nothing sandboxed) until the Parquet-backed query tools were added, then grown
+from two names to four when `describe_events`/`query_sql` were added — the principle held
+throughout: the selector names exactly the tools that should pay the sandbox round-trip, and
+defaults to none.
 
 ### `mount` — sharing directories with sandboxed code
 
@@ -156,13 +168,15 @@ commit that introduced `tools=[]` for the full before/after.
 mount=[
     MountDir("/workspace", str(ws_path), mode="read-write"),
     MountDir("/skill", str(skill_path.resolve()), mode="read-only"),
+    MountDir("/data-source", str(source_root), mode="read-only"),
+    MountDir("/data", str(source_root), mode="read-only"),
 ]
 ```
 
 `Monty`'s sandboxed interpreter has **no filesystem access by default** — `pathlib.Path("/etc/passwd")`
 just fails inside `run_code`, full stop, regardless of what the host process can see. `CodeMode.mount`
-accepts a single `MountDir` or a list of them; this project uses two, each punching one specific,
-explicit hole:
+accepts a single `MountDir` or a list of them; this project uses four entries over three distinct
+host directories, each punching one specific, explicit hole:
 
 - **`/workspace` → `ws_path`, `mode="read-write"`.** The same directory `FileSystem` is scoped
   to. Sandboxed code can create/modify files here, which is what lets generated code do
@@ -179,8 +193,25 @@ explicit hole:
   to already know Suricata's EVE schema from training data, which is why it went unnoticed. Adding
   this second mount makes the instruction actually work, and generalizes: any future skill's
   `references/` directory is reachable at `/skill/references/...` with no per-skill code changes.
+- **`/data-source` and `/data` → `source_root`, both `mode="read-only"`.** The same host
+  directory mounted twice under two virtual paths — `/data-source` is the current, canonical
+  name; `/data` is kept only as an alias so skills/prompts written against the older single-`/data`
+  layout keep working unchanged. `source_root` itself is resolved once at startup by
+  `_select_source_root()` (`workspace/data-source/` if it already exists as a real directory,
+  else `workspace/data/`) — never a union of both, so which files are visible doesn't depend on
+  mount order.
 
-Nothing outside these two mount points is reachable from sandboxed code, mount or no mount.
+Deliberately **not** mounted: `workspace/data-sink/parquet/`, the host-side Parquet cache all four
+sandboxed data tools read/write (`query_sql` included — it registers a lazy DuckDB `VIEW` over
+this same cache file rather than mounting or copying it). It stays host-only on purpose (see §4's
+`tools=[...]` discussion) — the sandbox has no Polars or DuckDB and cannot read Parquet directly,
+and there is no reason for model-written code to see cache-internal filenames (SHA-256
+fingerprints of source identity) at all. `describe_events`/`query_events`/`aggregate_events`/
+`query_sql` are the only path to that data, and they return plain dicts, never a path into the
+cache — including `query_sql`, whose `sql` argument is free text but whose *result* is still just
+a normalized dict, never a filesystem handle.
+
+Nothing outside these mount points is reachable from sandboxed code, mount or no mount.
 
 ### `os_access` — environment variables and the clock, deliberately gutted
 
@@ -208,10 +239,11 @@ real (but env-scrubbed) clock; nothing else about the host is exposed.
 sandbox-callable function signatures out of `run_code`'s tool description (which sits in the
 prompt-cache-keyed tool-definitions block) and into a separately-cached system-prompt segment.
 It only pays off when the sandboxed toolset changes mid-run — e.g. via `ToolSearch` discovering
-new tools. This project's toolset is static (and, post-fix, empty — `tools=[]` means `run_code`
-has zero sandbox-callable functions to render in the first place), so there's no cache-instability
-problem to solve. Worth revisiting only if a `ToolSearch` capability or dynamically-registered
-tools are added later.
+new tools. This project's sandboxed toolset (`describe_events`, `query_events`,
+`aggregate_events`, `query_sql`) is fixed for the life of a run — no `ToolSearch` capability is in
+play — so there's no cache-instability problem to solve; the four signatures render once into
+`run_code`'s description and stay there. Worth revisiting only if a `ToolSearch` capability or
+dynamically-registered tools are added later.
 
 ---
 
@@ -220,18 +252,20 @@ tools are added later.
 ```python
 capabilities = [
     FileSystem(root_dir=str(ws_path)),
-    CodeMode(tools=[], ...),
+    CodeMode(tools=["describe_events", "query_events", "aggregate_events", "query_sql"], ...),
 ]
 if args.thinking:
     capabilities.append(Thinking(effort=args.thinking))
 ```
 
 `FileSystem` is listed first so its tools exist on the agent before `CodeMode` decides how to
-present them. `CodeMode` declares itself `position='outermost'` internally (it wraps around the
-whole assembled toolset, including `ToolSearch` if present) — but *which* of those tools get
-folded into `run_code` is entirely controlled by `CodeMode.tools`, independent of list order.
-With `tools=[]`, order doesn't currently change behavior, but it's the natural place to add a
-selector predicate later if a future skill adds tools that *should* be sandboxed (see §8).
+present them; the four data tools themselves are registered via `Agent(tools=[...])`
+(not the `capabilities` list — they're ordinary `Tool` objects, not a capability). `CodeMode`
+declares itself `position='outermost'` internally (it wraps around the whole assembled toolset,
+including `ToolSearch` if present) — but *which* of those tools get folded into `run_code` is
+entirely controlled by `CodeMode.tools`, independent of list order. With a fixed four-name
+selector, order doesn't currently change behavior, but it's the natural place to add a selector
+predicate later if a future skill adds more tools that *should* be sandboxed.
 
 `Thinking` is appended last, and conditionally — it doesn't wrap or select tools the way
 `FileSystem`/`CodeMode` do, so its position relative to them doesn't matter; it's ordered last
@@ -254,10 +288,13 @@ container — it's a from-scratch Python-subset interpreter with its own type ch
   workaround (explicit `readline()` loop) because Monty's file objects don't support the
   iterator protocol the way host Python's do (`skills/suricata-analyst/SKILL.md:29-40`).
 - **Static type checking on the first call of a session.** Before running the model's code,
-  `CodeMode` type-checks it against stub signatures built from the sandboxed tool set
-  (irrelevant here since that set is empty, but this is why built-in exception names like
+  `CodeMode` type-checks it against stub signatures built from the sandboxed tool set — here,
+  the four data tools' real parameter and return types, so e.g. passing a `str` for
+  `limit` is caught before the sandbox ever runs (note: `query_sql`'s `sql` argument is still
+  free-text — the type checker confirms it's a `str`, not that it's valid SQL). This is also why
+  built-in exception names like
   `FileNotFoundError` don't resolve in `except` clauses under Monty's checker — the skill
-  documents catching `Exception` and branching on `type(e).__name__` instead).
+  documents catching `Exception` and branching on `type(e).__name__` instead.
 - **REPL-style state persistence.** Each `run_code` call in a run shares one `Monty` REPL session
   unless the model passes `restart=true` — variables from an earlier `run_code` call are still
   in scope in the next one, which is why the model doesn't need to re-read the log file from
@@ -296,10 +333,20 @@ prompt (+ existing-scripts note) ──► agent.run_sync(...)
 
 Native `FileSystem` calls and sandboxed `pathlib` calls through the workspace `MountDir` resolve
 to **the same directory on disk**, just addressed differently (relative path vs.
-`/workspace/...`) — that's the detail SKILL.md calls out explicitly, and the reason `tools=[]`
-matters: without it, the "native" path never actually got used. The skill `MountDir` is a
-separate, read-only view onto a different directory (`skill_path`, not `ws_path`) with no native
-equivalent at all — reference material is only reachable via `run_code`.
+`/workspace/...`) — that's the detail SKILL.md calls out explicitly, and the reason the `tools`
+selector matters: an over-broad selector routes calls that should be native through `run_code`
+instead. The skill `MountDir` is a separate, read-only view onto a different directory
+(`skill_path`, not `ws_path`) with no native equivalent at all — reference material is only
+reachable via `run_code`.
+
+The two sandboxed data tools sit alongside `run_code(code=...)` in the diagram above, not inside
+it: `query_events(...)`/`aggregate_events(...)` calls made from *within* sandboxed code are
+dispatched back out to the host process (never to `Monty` itself, which has no Polars), where
+`ensure_parquet_cache()` resolves the model's logical filename against `source_root`, converts to
+Parquet on first use, and returns plain dicts back into the sandbox. That round trip is invisible
+to the model beyond the function call itself — no separate tool-call/tool-result pair shows up
+the way it would for a *native* tool, because from `CodeMode`'s perspective this is still one
+`run_code` execution.
 
 ---
 
@@ -331,8 +378,8 @@ the two lines above.
 
 | Decision | Why |
 | --- | --- |
-| `CodeMode(tools=[])` instead of default `'all'` | Keeps `FileSystem` tools callable natively, matching `SKILL.md`'s explicit instructions and avoiding a wasted sandbox round-trip for simple directory/file operations |
-| `mount` = `[workspace rw, skill read-only]` | Sandboxed code gets real file I/O for the (potentially 250MB+) log data, plus read access to a skill's own reference material — without ever seeing the rest of the host filesystem, and without letting generated code modify the skill's source |
+| `CodeMode(tools=["query_events", "aggregate_events"])` instead of default `'all'` | Keeps `FileSystem`/`Memory` tools callable natively, matching `SKILL.md`'s explicit instructions and avoiding a wasted sandbox round-trip for simple directory/file operations; only the two host-side Polars helpers pay the sandbox round-trip, since only they need it |
+| `mount` = `[workspace rw, skill ro, data-source ro, data ro (alias)]`; `data-sink/` (Parquet cache) deliberately *not* mounted | Sandboxed code gets real file I/O for the (potentially 250MB+) log data, plus read access to a skill's own reference material — without ever seeing the rest of the host filesystem, letting generated code modify the skill's source, or seeing cache-internal Parquet filenames |
 | `os_access=OSAccess(environ={})` | Sandboxed code gets a working clock for filename timestamps, but zero visibility into host secrets/env vars |
 | `dynamic_catalog` left at default (`False`) | No `ToolSearch`/dynamic tool discovery in play yet — the cache-stability tradeoff it solves doesn't apply |
 | `Thinking` capability only added when `--thinking` is passed, with `model_settings["max_tokens"]` floored via pydantic-ai's own `ANTHROPIC_THINKING_BUDGET_MAP` | Reasoning effort should be opt-in, not always paid for; the floor prevents Anthropic's `max_tokens must be greater than thinking.budget_tokens` 400 without hand-duplicating pydantic-ai's own budget table |
