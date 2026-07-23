@@ -2,9 +2,9 @@
 
 This document details adding a third host-side query tool, `query_sql`, alongside the existing
 `query_events`/`aggregate_events`, plus a bounded `describe_events` schema helper and exact-match
-filters for the two existing Polars tools (see `DATA_SOURCE_SINK_PLAN.md`). Unlike the typed
+filters for the two existing Polars tools (see [`DATA_SOURCE_SINK_PLAN.md`](DATA_SOURCE_SINK_PLAN.md)). Unlike the typed
 tools, `query_sql` lets the model author the query itself, as SQL text, executed host-side by
-DuckDB against the same Parquet cache. This directly reverses `DATA_SOURCE_SINK_PLAN.md`'s
+DuckDB against the same Parquet cache. This directly reverses [`DATA_SOURCE_SINK_PLAN.md`](DATA_SOURCE_SINK_PLAN.md)'s
 original "no SQL, no model-authored query language" principle — that call was made before the
 typed tools had been exercised against real nested Suricata JSON (`tls.sni`,
 `dns.queries[].rrtype`), and in practice those nested fields are exactly what the flat,
@@ -22,7 +22,7 @@ DuckDB knowledge — see §2 for what was tested and how.
 ## 1. When to Use `query_events`/`aggregate_events` vs. `query_sql`
 
 Both stay available; this is additive, not a replacement (same principle as
-`DATA_SOURCE_SINK_PLAN.md` §1). An early draft of this plan justified keeping the typed tools
+[`DATA_SOURCE_SINK_PLAN.md` §1](DATA_SOURCE_SINK_PLAN.md#1-high-level-architecture--principles)). An early draft of this plan justified keeping the typed tools
 mainly on auditability grounds, plus a since-fixed ~130x performance gap (see §2's benchmark
 table) from a first-draft `query_sql` design that eagerly materialized the entire source file
 before running any query — the fixed design (§2) closes that gap, so the case below rests on
@@ -55,7 +55,7 @@ more convenient:
 - **Nested fields** — `tls.sni`, `dns.queries[].rrtype`, anything under a Parquet `STRUCT`/`LIST`
   column. `UNNEST` and struct dot-access solve this directly; the typed tools have no path to it
   at all short of pulling raw rows and writing a manual tally loop in the sandbox (exactly what
-  happened investigating DNS/TLS behavior — see `PROJECT.md`'s account of that run).
+  happened investigating DNS/TLS behavior — see [`PROJECT.md`](PROJECT.md)'s account of that run).
 - **Correlation across event types** — e.g. join `dns` and the `tls` connection that followed it
   by `src_ip` and a timestamp window, to spot DNS-then-connect beaconing patterns. There is no
   typed-tool equivalent of a `JOIN`.
@@ -227,7 +227,7 @@ limited_result = con.sql(sql).limit(limit + 1)
   self-inflicted materialization tax (that's what the `allowed_paths` fix removed) and not a
   confidentiality/traversal one — the spill goes to a host-controlled `scratch_dir` cleaned up in
   `finally`, never a path the model chose. Listed as an open item in §5, same posture as the
-  "Retention and permissions" open item in `refs/workspace-lifecycle.md`.
+  "Retention and permissions" open item in [`refs/workspace-lifecycle.md`](refs/workspace-lifecycle.md#open-items).
 - **No materialization cost, no column-pruning hack needed.** Because registration is a lazy
   `VIEW` over an allowlisted path rather than an eager `TABLE`, `query_sql` doesn't need any
   logic to guess which columns a query references ahead of time (an idea considered and dropped
@@ -372,7 +372,7 @@ names are a validation error rather than a lossy dict conversion.
 ### D. `skill_runner/resilience.py`
 
 Add `"describe_events"` and `"query_sql"` to `DATA_TOOL_NAMES` (the `OverflowingToolOutput`
-exemption set added for `query_events`/`aggregate_events` — see `PROJECT.md`'s account of that
+exemption set added for `query_events`/`aggregate_events` — see [`PROJECT.md`](PROJECT.md)'s account of that
 fix). Both have bounded return contracts and the same nested-tool-call exposure to
 `after_tool_execute` interception; without the exemption an oversized dict could be replaced by
 a spill-path string and silently break sandbox code expecting the documented result shape.
@@ -387,7 +387,7 @@ query runs against the full `events` view regardless of `limit` — `query_sql`'
 only on *returned* rows via `has_more`, unlike `query_events`'s page, which is explicitly not a
 complete sample); the `limit`/`MAX_SQL_ROWS` cap; and when to prefer it over the typed tools.
 Per the sequencing constraint already established for `sandbox_notes.md`
-(`DATA_SOURCE_SINK_PLAN.md` §4D), this text must land in the same change as §3B/§3C, never ahead
+([`DATA_SOURCE_SINK_PLAN.md` §4D](DATA_SOURCE_SINK_PLAN.md#d-prompt--skill-documentation-prompts-sandbox_notesmd)), this text must land in the same change as §3B/§3C, never ahead
 of them.
 
 ---

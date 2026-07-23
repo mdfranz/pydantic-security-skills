@@ -1,10 +1,10 @@
 # Architecture
 
 This document describes the system's components, how they relate, and where its trust
-boundaries sit. It does not cover installation or CLI usage (see `README.md`), the specific
-pydantic-ai/harness/Monty API calls and why each was chosen (see `PYDANTIC-STACK.md`), the
-history of how it got this way (see `PROJECT.md`), or the adversary model and asset-level risk
-tracking (see `THREAT_MODEL.md`).
+boundaries sit. It does not cover installation or CLI usage (see [`README.md`](README.md)), the specific
+pydantic-ai/harness/Monty API calls and why each was chosen (see [`PYDANTIC-STACK.md`](PYDANTIC-STACK.md)), the
+history of how it got this way (see [`PROJECT.md`](PROJECT.md)), or the adversary model and asset-level risk
+tracking (see [`THREAT_MODEL.md`](THREAT_MODEL.md)).
 
 ## System in one sentence
 
@@ -87,7 +87,7 @@ and dispatch to one of two UI drivers. The application code behind it is divided
   never scans rows) cover the common path; `query_sql` is the escape hatch letting the model
   author a read-only SQL `SELECT`, executed host-side by DuckDB, for nested `STRUCT`/`LIST`
   fields, cross-event-type correlation, and window/statistical functions the typed tools can't
-  express (see `SQL_QUERY_PLAN.md`). All four take a logical filename, never a host path.
+  express (see [`SQL_QUERY_PLAN.md`](SQL_QUERY_PLAN.md)). All four take a logical filename, never a host path.
   `ensure_parquet_cache` owns all path resolution/traversal defense and the one-time
   NDJSON→Parquet conversion (locked, atomic, fingerprinted by source identity) behind every call,
   including `query_sql`'s. `query_sql` layers a second, independent security boundary on top —
@@ -195,7 +195,7 @@ Capabilities compose to define what the agent can actually do, each independent 
   native. `run_code` is otherwise a Python execution surface for log analysis, not a wrapper
   around other capabilities — the four selected names are host-side Polars/DuckDB helpers
   (`data_tools.py`), not passthroughs to another capability. This selective-not-empty selector is
-  itself a deliberate, non-default configuration choice — see `PYDANTIC-STACK.md` §4 for why
+  itself a deliberate, non-default configuration choice — see [`PYDANTIC-STACK.md` §4](PYDANTIC-STACK.md#4-agent-configuration--tool-wiring) for why
   `tools='all'` is avoided.
 - **`OverflowingToolOutput`** — intercepts every tool result before it enters model history. At
   10,000 characters it stores the complete value in the task-scoped, owner-only
@@ -216,7 +216,7 @@ Capabilities compose to define what the agent can actually do, each independent 
   tools stay native rather than routing through `CodeMode`. Omitted entirely (not merely given an
   empty notebook) in pristine mode, so a pristine run's tool surface and prompt token count are
   identical regardless of whether the same task was ever run before — see "Workspace" below and
-  `refs/workspace-lifecycle.md`.
+  [`refs/workspace-lifecycle.md`](refs/workspace-lifecycle.md).
 
 ### Monty sandbox
 
@@ -279,7 +279,7 @@ summarizes:
 
 The isolation guarantee — an agent in one task can never read another task's directory or the
 audit log — holds only because the task root stays a validated, real, direct child of the
-workspace base; see `refs/workspace-lifecycle.md` for the invariants a future refactor must
+workspace base; see [`refs/workspace-lifecycle.md`](refs/workspace-lifecycle.md) for the invariants a future refactor must
 preserve. `Memory`'s scope isolation is a separate, complementary guarantee: every operation is
 prefixed server-side by `<skill>/<task_id>`, so one shared store root can't leak notes across
 tasks even though it isn't filesystem-mount-based like the other three domains.
@@ -300,7 +300,7 @@ returns too large to place in model history. The model cannot browse this direct
 byte count without duplicating the complete payload into JSONL.
 
 Two hardening details address the "Retention and permissions" open item in
-`refs/workspace-lifecycle.md`:
+[`refs/workspace-lifecycle.md`](refs/workspace-lifecycle.md#open-items):
 
 - **Permissions.** `workspace/logs/` is `chmod 0700` and each `.jsonl` file `0600` at creation,
   re-applied on every run rather than only on first creation, since audit records can contain
@@ -316,7 +316,7 @@ Two hardening details address the "Retention and permissions" open item in
   mapping must be caught in `runner.py`'s `main()` itself, not only under `if __name__ ==
   "__main__":` — the installed `skill-runner` console-script entry point calls `main()` directly
   and never runs through that guard, so a version living only there silently never fires for the
-  primary way this tool is actually invoked (`ISSUES.md` #13).
+  primary way this tool is actually invoked ([`ISSUES.md`](ISSUES.md)).
 - **`--max-run-seconds`.** A stuck turn (no forward progress at all — a hung network request, as
   opposed to a slow-but-working one) gets the identical clean shutdown as an external `SIGTERM`:
   `audit.py`'s `start_turn_watchdog()` starts a background timer per turn that delivers the
@@ -381,7 +381,7 @@ adds one more structural guarantee on top, scoped to that one tool: even though 
 argument is free text chosen entirely by the model, the DuckDB connection it runs against has no
 reachable filesystem or network path except the one allowlisted cache file, set before that text
 is ever executed — so the boundary holds regardless of what the SQL says, not because the text
-was inspected and judged safe. See "Isolation guarantee" in `refs/workspace-lifecycle.md` for the
+was inspected and judged safe. See ["Isolation guarantee" in `refs/workspace-lifecycle.md`](refs/workspace-lifecycle.md#isolation-guarantee) for the
 specific invariants this depends on (validated task roots, reserved names, no symlink/traversal
 task ids).
 

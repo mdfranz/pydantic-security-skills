@@ -790,6 +790,6 @@ enforced by the DuckDB connection itself rather than by inspecting the query tex
 
 - Authored `THREAT_MODEL.md` establishing explicit in-scope/trusted/out-of-scope adversary boundaries, an asset × boundary traceability matrix (host secrets, cross-task isolation, DuckDB Parquet cache, overflow store, audit log integrity), and prioritized open security risk items.
 - Significantly expanded `SQL_BOUNDARY_TESTING.md` with P0/P1/P2 task priorities, DuckDB version regression review procedures, exact C++ internal settings references (`EnableExternalAccessSetting::OnSet`, `CanonicalizePath()`, `bind_basetableref.cpp`), and exact sentinel assertion rules.
-- Updated `AGENTS.md`, `ARCHITECTURE.md`, `README.md`, `SQL_QUERY_PLAN.md`, and `refs/workspace-lifecycle.md` to cross-link `THREAT_MODEL.md` as the core documentation artifact for security risks and adversary modeling while maintaining minimal documentation overlap.
+- Updated `AGENTS.md`, `ARCHITECTURE.md`, `README.md`, `SQL_QUERY_PLAN.md`, `refs/workspace-lifecycle.md`, and `THREAT_MODEL.md` to establish complete, working relative markdown cross-links and section anchors between security risk modeling, architecture, query plans, and workspace lifecycle specs while maintaining minimal documentation overlap.
 
 
