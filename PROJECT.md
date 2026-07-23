@@ -792,4 +792,128 @@ enforced by the DuckDB connection itself rather than by inspecting the query tex
 - Significantly expanded `SQL_BOUNDARY_TESTING.md` with P0/P1/P2 task priorities, DuckDB version regression review procedures, exact C++ internal settings references (`EnableExternalAccessSetting::OnSet`, `CanonicalizePath()`, `bind_basetableref.cpp`), and exact sentinel assertion rules.
 - Updated `AGENTS.md`, `ARCHITECTURE.md`, `README.md`, `SQL_QUERY_PLAN.md`, `refs/workspace-lifecycle.md`, and `THREAT_MODEL.md` to establish complete, working relative markdown cross-links and section anchors between security risk modeling, architecture, query plans, and workspace lifecycle specs while maintaining minimal documentation overlap.
 
+---
+
+### Phase 22: Live-Trace Review — `UNNEST`/`GROUP BY` Doc Fix, Query-Latency Diagnostics, and a Before/After Efficiency Audit (2026-07-23, uncommitted)
+
+**Objective:** Use live `suricata-analyst` runs — cross-checked against both the local
+`workspace/logs/*.jsonl` audit trail and the `tomfoolery` Logfire project, not either alone — to
+find and close real gaps in the Phase 18/19 data tools and their prompt guidance, then use the
+same two-source method to answer a retrospective question: was replacing hand-rolled Monty JSON
+parsing with the Polars/DuckDB tools actually worth it?
+
+**Full evidence trail:** [refs/2026-07-23-live-trace-review.md](refs/2026-07-23-live-trace-review.md) — trace/span IDs, exact query
+text, before/after tables, and verification commands for everything summarized below.
+
+**Fix: the project's own canonical `UNNEST` example was the exact form DuckDB's binder rejects**
+- Reviewing a live `suricata-analyst`/`deepseek-v4-pro` trace (root span `b8b3eb78a3f121f6`) found
+  `DataToolError: sql query failed: Binder Error: UNNEST not supported here` on a `query_sql` call
+  that turned out to be a near-verbatim copy of the worked example in `prompts/sandbox_notes.md`'s
+  `query_sql` section and the "manual verification" query named in `SQL_QUERY_PLAN.md` §3. Both
+  put `UNNEST(...)` and `GROUP BY` in the same `SELECT` — DuckDB's binder rejects that combination
+  since `UNNEST` is a set-returning expression that can't be reconciled with aggregation in one
+  scope. The only test that actually exercises `UNNEST`
+  (`tests/test_data_tools.py::test_nested_unnest_query_returns_nested_shapes`) wraps it in a `WITH`
+  CTE first — the design doc's own canonical example had never been exercised by that test.
+- Rewrote both examples to the working CTE form (`WITH u AS (SELECT unnest(dns.queries) AS q FROM
+  events WHERE event_type = 'dns') SELECT q.rrtype AS rrtype, count(*) AS n FROM u GROUP BY 1
+  ORDER BY 2 DESC`) and added an explicit gotcha, both inline next to the `UNNEST` guidance and in
+  the compact stdlib-gotchas list, telling the model never to combine `UNNEST` with `GROUP BY`
+  directly. No `data_tools.py` changes needed — purely a prompt/doc defect, filed and closed as
+  `ISSUES.md` #14. A later live trace from the same day (`suricata-analyst`/`deepseek-v4-pro`
+  again, using `UNNEST`+`GROUP BY` repeatedly via the corrected CTE pattern) never reproduced the
+  error, corroborating but not proving the fix, since it's one model/one session.
+
+**Investigation: an unexplained `query_events` latency outlier, and why the obvious hypothesis was wrong**
+- A project-wide Logfire query over `execute_tool` span durations found `query_events` with a
+  p95 of 45.4ms but a max of 2070.2ms — a ~46x outlier, always on the first data-tool call of a
+  run. The obvious hypothesis — each task gets a fresh, empty Parquet cache, so the first query
+  per task always pays the NDJSON→Parquet conversion cost — turned out to be **wrong**, disproven
+  with code, disk, and `process_pid` evidence together: `run_core.py` sets `parquet_cache_root`
+  from the top-level `workspace/` directory (not the per-task `workspace/task-<uuid>/` directory),
+  confirmed on disk (`workspace/data-sink/parquet/` held exactly one persistent cache file, no
+  `task-*/` directory had its own); the cache key is stable (source file inode/mtime unchanged
+  across runs); and two runs sharing the same OS `process_pid`, three minutes apart, both still
+  paid a slow first call despite reusing the same warm process and already-built cache — ruling
+  out both cache-rebuild and one-time-library-import explanations.
+- **Fix**: added `DEBUG`-level logging (via `logging.getLogger(__name__)`, silent by default, no
+  new dependency) to `skill_runner/data_tools.py` — `ensure_parquet_cache` now logs an explicit
+  `parquet cache hit`/`parquet cache miss` line with `lock_wait_ms`/`convert_ms`, and
+  `query_events`/`aggregate_events`/`query_sql` log `collect_ms`/`execute_ms` for the actual
+  Polars/DuckDB call, separately from cache resolution. Wired into Logfire in
+  `run_core.py:_configure_logfire`: `logfire.LogfireLoggingHandler()` is attached to the
+  `data_tools` logger at `DEBUG`, but only when `--logfire` is passed, so these lines ride along
+  in the same traces this project already queries, at zero cost to non-`--logfire` runs. Verified
+  live with a real `logfire.configure(...)` + console exporter, and confirmed the new lines appear
+  correctly in a subsequent real Logfire trace during the same session. Filed as `ISSUES.md` #15,
+  left open pending the next occurrence of the latency pattern — the debug lines now make cache
+  state directly observable instead of inferred. All 45 `test_data_tools.py` and 58 combined
+  `test_data_tools.py`+`test_run_core.py` tests pass unchanged; this is logging only, no behavior
+  change.
+
+**Live-trace agent-performance review**
+- Reviewed a full 4-checkpoint interactive session (`task-25132bfe-4b07-4476-8a37-5c1beae1cdb6`,
+  245.4s total across 4 Logfire traces/root spans, one per checkpoint) end to end against both the
+  audit log and Logfire. Found tool/data-layer execution is consistently 1-6% of each checkpoint's
+  wall-clock time — 94-99% is model (`deepseek-v4-pro`) inference latency — meaning further
+  data-tool optimization has a low ceiling for overall run time, while retries are expensive: 3
+  errors this session (a new, single-occurrence DuckDB CTE-scoping mistake, plus two recurrences
+  of the already-documented `json.dumps(..., default=str)` Monty gotcha) cost ~38.7s (16% of the
+  session) in extra model turns, since each retry is a full extra inference round-trip even though
+  the underlying tool-side error costs milliseconds. Confirmed the proven `script_lint.py`
+  auto-fix pattern (Phase 3-era, `ISSUES.md` #3) doesn't cover this: it only cleans saved `.py`
+  files between runs, never the live `code` argument of a `run_code` call, and the live path is
+  owned by the third-party `pydantic-ai-harness` dependency (`CodeMode`), not this repo — so a
+  live-code fix would need to cross that library boundary, a materially bigger change than the
+  in-repo script lint. No action taken pending a scoping decision.
+
+**Before/after efficiency and quality audit (Polars/DuckDB tools vs. the Phase 1-17 hand-rolled approach)**
+- Compared today's tool-based runs against the two pre-Phase-18 model-comparison reports
+  (`results/pristine-model-comparison-2026-07-19.md`, `results/logfire-console-eve-model-
+  comparison-2026-07-19.md`), both against the identical `eve-2026-01-06-01.json` fixture —
+  re-verified by directly re-deriving the reports' own duration/call-count claims from the raw
+  `workspace/logs/runner-task-*.jsonl` audit files (all 4 spot-checked files matched within
+  rounding) and cross-checked independently against Logfire (`invoke_agent suricata-analyst`
+  spans for 2026-07-19, still within Logfire's 14-day window), which also reproduced the GLM-5.2
+  slow-run durations and both qwen3.6-flash crash traces from the report.
+- **Efficiency**: the old hand-rolled-Python approach needed up to 20-30 model turns just to
+  gather evidence for a single analysis pass (two DeepSeek attempts exhausted 8- and 16-request
+  budgets before synthesis; Gemini 3.5 Flash needed 30) — every new question cost a fresh scan
+  loop. Today's tool-based checkpoints needed as few as 7 turns for comparably deep, cited
+  findings. Since tool execution is 1-6% of wall time either way, a ~3-4x turn-count reduction
+  translates almost directly into a ~3-4x wall-clock reduction, and eliminates the
+  request-budget-exhaustion failure mode outright.
+- **Quality**: better for *recall* of rare facts, not for model *judgment*. A real, verified
+  53-hour long-lived flow (1-in-227,732 records) was surfaced in only 1 of 9 old-approach runs —
+  an artifact of ad hoc per-run scan logic, not bad luck — whereas `aggregate_events`/`query_sql`
+  run exact, complete-dataset computations by design, deterministically catching such outliers
+  regardless of which specific query the model writes. But the old comparison's other headline
+  finding — GLM-5.2 finding the same real MQTT beacon in all 3 reps while flip-flopping its own
+  severity verdict between them — is a judgment/calibration issue outside what query tooling
+  touches; nothing in today's data suggests that's improved.
+
+**Result:** One prompt-doc defect closed (`ISSUES.md` #14) with corroborating evidence from a
+later independent trace; query-latency diagnostics added and wired into Logfire (`ISSUES.md` #15,
+left open pending recurrence); a scoped-but-undecided finding on live-code retry cost (script-lint
+doesn't reach `run_code`'s live path, and the path it would need to reach crosses into a
+third-party dependency); and a two-source-verified (audit log + Logfire, not either alone)
+retrospective confirming the Phase 18/19 tool investment measurably reduced both turn count and
+missed-finding rate relative to the project's original hand-rolled-parsing approach, while leaving
+model judgment/calibration consistency as a separate, still-open problem.
+
+---
+
+### Phase 23: Correct Task-Resume Commands (2026-07-23, uncommitted)
+
+**Problem found from a real resume audit:** The printed console resume command supplied the skill
+directory as its only positional argument. The CLI therefore interpreted that path as the prompt,
+silently selected the default skill, dropped the prior model and `--interactive` settings, and ran
+a new one-shot analysis. The task selection itself worked: the resumed run reused the same task
+workspace and read its prior report and scripts.
+
+**Fix:** `build_resume_hint()` now uses the unambiguous `--skill` option, supplies an explicit
+state-resume prompt in console mode, and preserves the selected model, UI/interactive behavior,
+thinking mode, observability/debug flags, and explicitly configured run limits. Textual resumes
+remain promptless so the input bar supplies the first resumed turn. Added parser round-trip tests
+for both console and Textual commands.
 

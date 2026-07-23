@@ -99,8 +99,8 @@ event types, or window/statistical functions — not merely when SQL would be mo
 ```python
 result = query_sql(
     name="eve-2026-01-06-01.json",
-    sql="SELECT unnest(dns.queries).rrtype AS rrtype, count(*) AS n "
-        "FROM events WHERE event_type = 'dns' GROUP BY 1 ORDER BY 2 DESC",
+    sql="WITH u AS (SELECT unnest(dns.queries) AS q FROM events WHERE event_type = 'dns') "
+        "SELECT q.rrtype AS rrtype, count(*) AS n FROM u GROUP BY 1 ORDER BY 2 DESC",
     limit=100,
 )
 # result = {"columns": ["rrtype", "n"], "rows": [{"rrtype": "A", "n": 1832}, ...],
@@ -114,6 +114,11 @@ structurally cannot express:
 - **Nested fields** — `tls.sni`, `dns.queries[].rrtype`, anything under a `STRUCT`/`LIST` column.
   Use `UNNEST(...)` and struct dot-access (`tls.sni`), as in the example above. Call
   `describe_events` first if you're not sure a field is present or what it's called.
+  **`UNNEST` cannot appear in the same `SELECT` as a `GROUP BY`** — DuckDB's binder rejects it
+  (`Binder Error: UNNEST not supported here`) because `UNNEST` is a set-returning expression and
+  can't be reconciled with aggregation in one scope. Always split it into a `WITH` CTE that does
+  the `UNNEST`, then `GROUP BY` in the outer `SELECT` over the CTE, exactly as in the example
+  above — never write `SELECT unnest(col).field, count(*) FROM events ... GROUP BY 1` directly.
 - **Correlation across event types** — `JOIN events a ON ... JOIN events a2 ON ...`-style
   self-joins, e.g. matching a `dns` row to the `tls` connection that followed it.
 - **Statistical/window functions** — `stddev`, `percentile_cont`, `ROW_NUMBER() OVER (...)`,
@@ -190,6 +195,9 @@ A few other stdlib/builtin gaps that are easy to reach for out of habit and will
   `pydantic_core.ValidationError` like `Input should be a valid string [type=string_type,
   input_value=3478, input_type=int]`. Always `str()` the key when building a dict you intend to
   return or print as JSON: `results[str(dest_port)] = ...`.
+- In `query_sql`, `UNNEST(...)` combined with `GROUP BY` in the same `SELECT` fails with
+  `Binder Error: UNNEST not supported here` — wrap the `UNNEST` in a `WITH` CTE and `GROUP BY` in
+  the outer query instead (see the `query_sql` section above for the working form).
 
 ## Python Style & Working Agreements
 

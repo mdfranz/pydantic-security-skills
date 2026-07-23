@@ -1,5 +1,6 @@
 """Run preparation: secure workspace resolution, prompt assembly, and agent construction."""
 
+import logging
 import re
 import shlex
 import uuid
@@ -250,6 +251,14 @@ def _configure_logfire(options: RunOptions, sink: StatusSink) -> None:
 
         logfire.configure(console=False if options.ui == "textual" else None)
         logfire.instrument_pydantic_ai()
+
+        # data_tools' cache-hit/miss and query-timing debug logs (plain stdlib `logging`,
+        # silent without a handler) ride along as Logfire log entries in the same trace --
+        # only under --logfire, so a non-Logfire run pays no cost for this.
+        data_tools_logger = logging.getLogger(data_tools.__name__)
+        data_tools_logger.addHandler(logfire.LogfireLoggingHandler())
+        data_tools_logger.setLevel(logging.DEBUG)
+
         sink.status("Logfire configured and instrumentation enabled.")
     except Exception as exc:
         sink.status(f"Logfire not available: {exc}")
@@ -536,13 +545,51 @@ def prepare_run(
 
 
 def build_resume_hint(skill_dir: str, task_id: str, options: RunOptions, *, ui: str | None = None) -> str:
-    """The copy-pasteable command that continues this exact task workspace later -- most useful
-    for --pristine, whose task-<uuid4> id is otherwise invisible outside workspace/logs/. Always
-    includes skill_dir/--workspace explicitly rather than omitting them when they match today's
-    defaults, so the printed command is correct regardless of the caller's cwd or this module's
-    own default constants. Deliberately omits --model/--thinking/--max-*/etc -- those are
-    per-invocation tuning choices, not part of the task's identity."""
-    parts = ["uv run skill-runner", shlex.quote(skill_dir), "--task", task_id, "--workspace", shlex.quote(str(options.workspace))]
-    if ui == "textual":
+    """Build a copy-pasteable command that reopens the task with the current run settings.
+
+    ``--skill`` keeps the skill path unambiguous when a console resume also needs a positional
+    prompt. Console mode supplies that prompt explicitly; otherwise the positional resolver
+    would mistake a lone skill path for the prompt and silently run the default skill. Textual
+    mode opens with no prompt because its input bar provides the first resumed turn.
+    """
+    selected_ui = ui or options.ui
+    parts = [
+        "uv run skill-runner",
+        "--skill",
+        shlex.quote(skill_dir),
+        "--task",
+        shlex.quote(task_id),
+        "--workspace",
+        shlex.quote(str(options.workspace)),
+        "--model",
+        shlex.quote(options.model),
+    ]
+
+    if selected_ui == "textual":
         parts += ["--ui", "textual"]
+    else:
+        parts.append(
+            shlex.quote(
+                "Resume this task from its existing workspace state. "
+                "Summarize prior progress and continue from where it left off."
+            )
+        )
+
+    if options.interactive:
+        parts.append("--interactive")
+    if options.thinking:
+        parts += ["--thinking", options.thinking]
+    if options.debug:
+        parts.append("--debug")
+    if options.logfire:
+        parts.append("--logfire")
+    if options.max_tokens is not None:
+        parts += ["--max-tokens", str(options.max_tokens)]
+    if options.max_retries != 5:
+        parts += ["--max-retries", str(options.max_retries)]
+    if options.max_run_seconds is not None:
+        parts += ["--max-run-seconds", str(options.max_run_seconds)]
+    if options.max_turns is not None:
+        parts += ["--max-turns", str(options.max_turns)]
+
     return " ".join(parts)

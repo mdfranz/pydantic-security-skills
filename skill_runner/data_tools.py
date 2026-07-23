@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import logging
 import os
 import re
 import shutil
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -24,6 +26,12 @@ from typing import Iterator
 import duckdb
 import polars as pl
 from pydantic_ai.exceptions import ModelRetry
+
+# Silent unless the caller configures this logger (e.g. `logging.basicConfig(level=logging.
+# DEBUG)`) -- distinguishes "Parquet cache hit" from "cache miss, converting" from "cache hit
+# but the query itself was slow" for otherwise-unexplained latency spikes, without adding a
+# hard dependency on logfire (which is only imported, optionally, in run_core.py).
+_logger = logging.getLogger(__name__)
 
 # Bounds on model-controlled arguments so a tool result can never be unbounded.
 MAX_PAGE_ROWS = 500
@@ -76,10 +84,15 @@ def query_events(
     if columns:
         lf = lf.select(columns)
 
+    collect_start = time.monotonic()
     try:
         rows = lf.slice(offset, limit + 1).collect().to_dicts()
     except pl.exceptions.ColumnNotFoundError as exc:
         raise DataToolError(f"unknown column in query: {exc}") from exc
+    _logger.debug(
+        "query_events collect_ms=%.1f name=%r event_type=%r rows=%d",
+        (time.monotonic() - collect_start) * 1000, name, event_type, len(rows),
+    )
 
     return {
         "rows": rows[:limit],
@@ -114,9 +127,14 @@ def aggregate_events(
         lf = lf.filter(pl.col("event_type") == event_type)
     lf = _apply_equals(lf, validated_equals)
 
+    collect_start = time.monotonic()
     try:
         if not group_by:
             count = lf.select(pl.len()).collect().item()
+            _logger.debug(
+                "aggregate_events collect_ms=%.1f name=%r event_type=%r group_by=None",
+                (time.monotonic() - collect_start) * 1000, name, event_type,
+            )
             return {"count": int(count)}
 
         grouped = (
@@ -128,6 +146,10 @@ def aggregate_events(
         )
     except pl.exceptions.ColumnNotFoundError as exc:
         raise DataToolError(f"unknown column in group_by: {exc}") from exc
+    _logger.debug(
+        "aggregate_events collect_ms=%.1f name=%r event_type=%r group_by=%r groups=%d",
+        (time.monotonic() - collect_start) * 1000, name, event_type, group_by, len(grouped),
+    )
 
     rows = grouped.to_dicts()
     return {
@@ -274,11 +296,18 @@ def ensure_parquet_cache(name: str, source_root: Path, cache_root: Path, *, max_
         final_path = resolved_cache_root / f"{key}.parquet"
         lock_path = resolved_cache_root / f"{key}.lock"
 
+        lock_wait_start = time.monotonic()
         with _locked(lock_path):
+            lock_wait_ms = (time.monotonic() - lock_wait_start) * 1000
             # Re-check after acquiring the lock: a competing runner may have completed
             # conversion while this process waited.
             if _is_valid_parquet_file(final_path):
+                _logger.debug(
+                    "parquet cache hit name=%r key=%s lock_wait_ms=%.1f",
+                    name, key[:12], lock_wait_ms,
+                )
                 return final_path
+            convert_start = time.monotonic()
             try:
                 published = _convert_to_parquet(
                     source_path, source_path.parent, name, key, resolved_cache_root, final_path
@@ -287,6 +316,11 @@ def ensure_parquet_cache(name: str, source_root: Path, cache_root: Path, *, max_
                 last_error = DataToolError(f"failed to convert {name!r} to Parquet: {exc}")
                 continue
             if published:
+                convert_ms = (time.monotonic() - convert_start) * 1000
+                _logger.debug(
+                    "parquet cache miss name=%r key=%s lock_wait_ms=%.1f convert_ms=%.1f",
+                    name, key[:12], lock_wait_ms, convert_ms,
+                )
                 return final_path
 
     raise last_error or DataToolError(f"source {name!r} kept changing during Parquet conversion")
@@ -456,6 +490,8 @@ def query_sql(
 
         timer = threading.Timer(SQL_QUERY_TIMEOUT_SECONDS, con.interrupt)
         timer.start()
+        execute_start = time.monotonic()
+        fetched: list[object] | None = None
         try:
             # Host-controlled relational LIMIT via the relation API (not textual SQL wrapping
             # -- the parser accepts a terminal semicolon followed by a comment, which cannot
@@ -474,6 +510,12 @@ def query_sql(
             raise DataToolError(f"sql query failed: {exc}") from exc
         finally:
             timer.cancel()
+            _logger.debug(
+                "query_sql execute_ms=%.1f name=%r rows=%s",
+                (time.monotonic() - execute_start) * 1000,
+                name,
+                len(fetched) if fetched is not None else "error",
+            )
     finally:
         if con is not None:
             con.close()

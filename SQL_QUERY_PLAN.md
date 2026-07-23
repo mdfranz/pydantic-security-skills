@@ -469,6 +469,8 @@ Per project convention, tests assert **behavior**, not implementation details of
 3. **Manual verification against the real fixture** (176MB EVE log, per the DNS/TLS
    characterization run already exercised in this project): confirm a `query_sql` call answering
    the same DNS/TLS questions that previously required a manual client-side tally loop — a
-   `SELECT unnest(dns.queries).rrtype AS rrtype, count(*) FROM events WHERE event_type='dns' GROUP
-   BY 1 ORDER BY 2 DESC` — returns the exact same distribution in one call, with no pagination
-   loop and no client-side counting.
+   `WITH u AS (SELECT unnest(dns.queries) AS q FROM events WHERE event_type = 'dns') SELECT
+   q.rrtype AS rrtype, count(*) AS n FROM u GROUP BY 1 ORDER BY 2 DESC` (note: `UNNEST` and
+   `GROUP BY` can't share one `SELECT` — DuckDB's binder rejects that combination — so the
+   `UNNEST` is split into a CTE) — returns the exact same distribution in one call, with no
+   pagination loop and no client-side counting.

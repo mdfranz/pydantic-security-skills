@@ -393,3 +393,93 @@ regardless of entry point. The `if __name__ == "__main__":` block is now a trivi
 Verified end-to-end: `--max-run-seconds 5` against a real model now exits `143` with no traceback,
 and the audit log shows a clean `interrupted` → `run_end status=failed` sequence instead of an
 `error` event.
+
+## 14. [Mitigated] The project's own canonical `UNNEST` example combined it with `GROUP BY` in one `SELECT` — the exact form DuckDB's binder rejects
+
+Caught live in a `suricata-analyst` / `deepseek-v4-pro` run (`workspace/logs/runner-task-5635a679-
+4669-4512-b923-8128e344b840-*.jsonl`, 2026-07-23 ~13:24 UTC, cross-checked against the matching
+`tomfoolery` Logfire traces): the model authored `SELECT unnest(dns.queries).rrtype AS rrtype,
+count(*) AS n FROM events WHERE event_type = 'dns' GROUP BY 1 ORDER BY 2 DESC` via `query_sql` and
+got `DataToolError: sql query failed: Binder Error: UNNEST not supported here`.
+
+That query wasn't a model mistake — it's a near-verbatim copy of the worked example in
+`prompts/sandbox_notes.md`'s `query_sql` section (shown to every skill run) and the "manual
+verification" target query named in `SQL_QUERY_PLAN.md` §3. Both examples put `UNNEST(...)` and
+`GROUP BY` in the same `SELECT`, which DuckDB's binder does not support — `UNNEST` is a
+set-returning expression and can't be reconciled with aggregation in one scope. The *only* tested
+form (`tests/test_data_tools.py::test_nested_unnest_query_returns_nested_shapes`) wraps the
+`UNNEST` in a `WITH` CTE first and aggregates in the outer query — the design doc's own canonical
+example was never actually exercised by that test.
+
+**Mitigation shipped**: rewrote both examples (`prompts/sandbox_notes.md`, `SQL_QUERY_PLAN.md` §3)
+to the working CTE form — `WITH u AS (SELECT unnest(dns.queries) AS q FROM events WHERE
+event_type = 'dns') SELECT q.rrtype AS rrtype, count(*) AS n FROM u GROUP BY 1 ORDER BY 2 DESC` —
+and added an explicit gotcha (both inline next to the `UNNEST` guidance and in the compact
+stdlib-gotchas list) telling the model never to combine `UNNEST` with `GROUP BY` directly. No
+`data_tools.py` code changes were needed; this was purely a prompt/doc defect, but one that was
+actively steering every model toward a query guaranteed to fail on first try.
+
+## 15. Unexplained latency spikes in `query_events`/`query_sql` — no telemetry to tell cache-miss from cold I/O from lock contention
+
+While reviewing a `suricata-analyst` trace (`tomfoolery` Logfire span `b8b3eb78a3f121f6`, trace
+`019f8fb8f5cb733f47672ece66c0f480`) at the user's request to look at `duration_ms` performance, a
+project-wide query over the last 2 days of `execute_tool` spans showed `query_events` with a
+p95 of 45.4ms but a **max of 2070.2ms** — a ~46x outlier. The 5 slowest calls were all small
+(`limit<=50`) queries, and all were the first data-tool call of their run.
+
+The obvious hypothesis — each new task gets a fresh, empty Parquet cache, so the first query per
+task always pays the NDJSON-to-Parquet conversion cost — turned out to be **wrong**, and worth
+recording so it isn't re-investigated the same way twice:
+
+- `run_core.py:203-213` sets `parquet_cache_root` from `options.workspace.resolve()`, the
+  **top-level** `./workspace` directory (the CLI default), not the per-task `workspace/task-
+  <uuid>/` directory — confirmed against `refs/workspace-lifecycle.md`'s documented shared path.
+  On disk, `workspace/data-sink/parquet/` held exactly one cache file, and none of the 56
+  `task-*/` directories had their own — the cache is genuinely shared and persistent.
+- The cache key (`_cache_identity`, `data_tools.py`) is `sha256(source_root|name|st_dev|st_ino|
+  st_size|st_mtime_ns)`. The actual source file's inode and mtime are stable (nothing re-copies
+  it between runs), so every run computes the same key and should hit the same warm cache.
+- Checking `process_pid` on the Logfire records ruled out "one-time Polars import cost per OS
+  process" too: two runs sharing the same PID (21282), 3 minutes apart, both paid a slow first
+  `query_events` call despite the second run reusing the same warm process and the same
+  already-built cache file.
+
+So the cache is not being rebuilt, and it is not a one-time process-level cost — but *something*
+about the first data-tool call of each run is still consistently slower than subsequent calls in
+the same run, and the current telemetry (Logfire's `execute_tool` span duration, and the local
+audit log's `duration_ms`, which only times the outer `run_code` call and never isolates
+`query_sql`/`aggregate_events`/`query_events` at all — see the conversation that produced this
+entry) can't distinguish cold-disk-I/O-on-first-touch from lock contention from something else.
+
+**Mitigation shipped**: `data_tools.py` now logs at `DEBUG` (via `logging.getLogger(__name__)`,
+silent by default — no `logfire` dependency added, since `data_tools.py` doesn't otherwise import
+it and `logfire.configure()` is optional/CLI-gated in `run_core.py`) three previously-invisible
+timings:
+- `ensure_parquet_cache`: `lock_wait_ms` (fcntl contention) and, separately, `convert_ms` on a
+  miss — a debug line literally says `parquet cache hit` or `parquet cache miss`, closing the
+  "was this actually a rebuild?" question directly instead of by inference.
+- `query_events`/`aggregate_events`: `collect_ms` for the actual Polars `.collect()` call, after
+  cache resolution.
+- `query_sql`: `execute_ms` for the DuckDB `fetchall()` call, after cache resolution.
+
+Verified manually (see conversation) that a cold call logs `parquet cache miss ... convert_ms=`
+and a warm repeat logs `parquet cache hit ... lock_wait_ms=` with no `convert_ms`, and that
+`collect_ms`/`execute_ms` are logged on every call regardless of cache state — so the next
+occurrence of this latency pattern will show directly whether it's `convert_ms` (still, somehow,
+a real cache rebuild), `lock_wait_ms` (contention from concurrent runs), or a large `collect_ms`/
+`execute_ms` with a cache *hit* (genuine cold-disk-I/O or query-plan cost) still open as the
+likely explanation.
+
+These logs are plain stdlib `logging` (`logging.getLogger("skill_runner.data_tools")`) and are
+silent with no handler attached — they don't reach the local audit log (`AuditLog.event()` in
+`audit.py` is only fed by `pydantic_ai`'s `FunctionToolCallEvent`/`FunctionToolResultEvent`
+stream, i.e. only tool calls the model itself makes; `query_events`/`aggregate_events`/
+`query_sql` run *inside* `run_code` as plain function calls, invisible to that stream, same
+reason their timing was never in the audit log to begin with). `run_core.py:_configure_logfire`
+now attaches `logfire.LogfireLoggingHandler()` to that logger at `DEBUG` and only when
+`--logfire` is passed, so these lines ride along as log entries in the same Logfire traces this
+project already queries for analysis — verified end-to-end with a real `logfire.configure(...)`
++ console exporter. A non-`--logfire` run pays no cost and sees nothing, by design.
+
+All 58 tests (`test_data_tools.py` + `test_run_core.py`) pass unchanged; this is logging only, no
+behavior change.
