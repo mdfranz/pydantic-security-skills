@@ -132,6 +132,9 @@ characters, Unicode-normalization collisions, and filename injection into audit 
 
 ## Isolation guarantee
 
+See [THREAT_MODEL.md](../THREAT_MODEL.md) §3 for this boundary's place in the system-wide
+asset/adversary matrix — it currently has no dedicated adversarial test coverage.
+
 The agent touches the filesystem through four access points, and none of them can reach
 `workspace/logs/`:
 

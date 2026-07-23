@@ -2,8 +2,9 @@
 
 This document describes the system's components, how they relate, and where its trust
 boundaries sit. It does not cover installation or CLI usage (see `README.md`), the specific
-pydantic-ai/harness/Monty API calls and why each was chosen (see `PYDANTIC-STACK.md`), or the
-history of how it got this way (see `PROJECT.md`).
+pydantic-ai/harness/Monty API calls and why each was chosen (see `PYDANTIC-STACK.md`), the
+history of how it got this way (see `PROJECT.md`), or the adversary model and asset-level risk
+tracking (see `THREAT_MODEL.md`).
 
 ## System in one sentence
 

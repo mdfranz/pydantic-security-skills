@@ -781,5 +781,15 @@ enforced by the DuckDB connection itself rather than by inspecting the query tex
 
 - Updated `make_event_stream_handler` in `skill_runner/audit.py` to record monotonic start times (`time.monotonic()`) keyed by `tool_call_id` on `FunctionToolCallEvent`, and calculate execution duration (`duration_ms`, rounded to 2 decimal places) when emitting `FunctionToolResultEvent`.
 - Updated `tests/test_resilience.py` and added `EventStreamHandlerTests` to `tests/test_audit.py` to assert accurate `duration_ms` emission for tool execution audit logs.
-- Created `SQL_BOUNDARY_TESTING.md` detailing the adversarial test matrix and security boundary verification specification for the `query_sql` interface and Python sandbox.
+
+---
+
+### Phase 21: System Threat Model & Security Boundary Refinement (2026-07-23)
+
+**Objective:** Define the system-wide adversary model, asset-to-boundary traceability matrix, and security test specifications.
+
+- Authored `THREAT_MODEL.md` establishing explicit in-scope/trusted/out-of-scope adversary boundaries, an asset × boundary traceability matrix (host secrets, cross-task isolation, DuckDB Parquet cache, overflow store, audit log integrity), and prioritized open security risk items.
+- Significantly expanded `SQL_BOUNDARY_TESTING.md` with P0/P1/P2 task priorities, DuckDB version regression review procedures, exact C++ internal settings references (`EnableExternalAccessSetting::OnSet`, `CanonicalizePath()`, `bind_basetableref.cpp`), and exact sentinel assertion rules.
+- Updated `AGENTS.md`, `ARCHITECTURE.md`, `README.md`, `SQL_QUERY_PLAN.md`, and `refs/workspace-lifecycle.md` to cross-link `THREAT_MODEL.md` as the core documentation artifact for security risks and adversary modeling while maintaining minimal documentation overlap.
+
 

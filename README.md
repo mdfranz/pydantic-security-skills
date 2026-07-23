@@ -15,6 +15,7 @@ threats, suspicious egress, protocol anomalies).
 ## Further reading
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — components, structure, and trust boundaries.
+- [`THREAT_MODEL.md`](THREAT_MODEL.md) — adversary model, asset/boundary traceability matrix, and open security risk items.
 - [`SQL_QUERY_PLAN.md`](SQL_QUERY_PLAN.md) — technical design plan for host-side model-authored SQL via DuckDB.
 - [`SQL_BOUNDARY_TESTING.md`](SQL_BOUNDARY_TESTING.md) — test matrix and security boundary verification for `query_sql` and the Python sandbox.
 - [`skill_runner/IMPL.md`](skill_runner/IMPL.md) — implementation-level reference for the

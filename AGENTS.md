@@ -9,6 +9,7 @@ Keep the following up to date if they exist and there should be minimum overlap
 - ARCHITECTURE.md - structure and data flows - not how to use, often uses Mermaid diagrams
 - README.md - high level documentation with links to other docs
 - PROJECT.md - chronology of commits and development phases
+- THREAT_MODEL.md - adversary model, asset/boundary traceability, and open security risk items - not how components work, that's ARCHITECTURE.md
 
 Only update if they exist.
 
