@@ -498,3 +498,24 @@ phase reaches its cap, the next sandbox call is skipped with a checkpoint instru
 model continues by attempting another tool, the runner returns a deterministic successful
 checkpoint instead of failing the session. This preserves the completed evidence while restoring
 user control.
+
+## 17. Interactive-run wall time is overwhelmingly model inference, while the runner has no graceful per-request latency boundary
+
+Three 2026-07-24 interactive runs reached the same conclusion from independent audit and Logfire
+evidence: data-tool execution is not the source of the long waits. The Kimi K3 focused turn spent
+337.3 of 339.1 seconds in seven model calls (99.5%); Qwen 3.7 Max spent 263.1 seconds in 17 model
+calls versus 4.4 seconds in all tool spans (98.4%); and Claude Sonnet 5 spent 210.6 of 212.1
+seconds in 21 model calls (99.3%). Gemini 3.1 Pro was materially faster per call, but still spent
+91.0 of 92.0 seconds in model calls (98.97%).
+
+The current `--max-run-seconds` watchdog is deliberately a whole-turn SIGTERM interruption, so
+it protects against a hang but discards the interactive turn instead of returning a checkpoint.
+The phase `run_code` budgets mitigate excessive *numbers* of model requests but cannot bound a
+single 60- to 90-second model response (as seen in Kimi) or give the user control while it is in
+flight.
+
+**Suggested fix:** add an optional per-model-request deadline with a graceful recovery path. On
+expiry, preserve completed tool results and transcript state, emit an explicit latency checkpoint,
+and return control to the interactive UI rather than treating the whole process as interrupted.
+Compare provider support and behavior first: cancelling an in-flight request must not corrupt
+message history or leave a provider-side background request running.
