@@ -1,6 +1,7 @@
 """Deterministic cleanup for workspace scripts saved across runs (see run_core.py's
 sandbox-notes docstring for why this exists instead of relying on model compliance)."""
 
+import ast
 import re
 import textwrap
 from pathlib import Path
@@ -13,6 +14,32 @@ from typing import Callable
 # against it. Lint and auto-fix it deterministically instead of relying on the model to comply.
 MAIN_GUARD_RE = re.compile(r'^if __name__ == [\'"]__main__[\'"]\s*:[ \t]*(?:#.*)?\n', re.MULTILINE)
 SYS_ARGV_RE = re.compile(r'\bsys\.argv\b')
+
+
+def _comma_format_lines(text: str) -> tuple[int, ...]:
+    """Find f-string format specifications Monty cannot reuse.
+
+    Monty rejects Python's comma thousands separator (for example, ``{count:,d}`` or
+    ``{count:>12,}``). Parsing first keeps ordinary commas in strings and expressions from
+    producing a warning.
+    """
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return ()
+
+    lines: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FormattedValue) or not isinstance(node.format_spec, ast.JoinedStr):
+            continue
+        literals = (
+            value.value
+            for value in node.format_spec.values
+            if isinstance(value, ast.Constant) and isinstance(value.value, str)
+        )
+        if any("," in literal for literal in literals):
+            lines.add(node.lineno)
+    return tuple(sorted(lines))
 
 
 def lint_and_fix_scripts(ws_path: Path, on_message: Callable[[str], None] = print) -> None:
@@ -39,4 +66,11 @@ def lint_and_fix_scripts(ws_path: Path, on_message: Callable[[str], None] = prin
                 f"Warning: {script_path.name} uses sys.argv, which is not settable in the "
                 "Monty sandbox and will fail when reused. Fix manually -- replace with a plain "
                 "variable assigned near the top of the file."
+            )
+
+        for line_number in _comma_format_lines(text):
+            on_message(
+                f"Warning: {script_path.name}:{line_number} uses an f-string comma format "
+                "specifier, which Monty does not support. Remove the thousands separator "
+                "before reusing this script."
             )

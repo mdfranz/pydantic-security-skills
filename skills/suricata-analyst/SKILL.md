@@ -1,9 +1,9 @@
 ---
 name: suricata-analyst
-description: Analyzes Suricata EVE JSON logs to identify network threats, suspicious egress, and protocol anomalies. Use when a user provides eve.json logs, asks for network traffic analysis, or needs to hunt for C2 beaconing and data exfiltration.
+description: Analyzes Suricata EVE JSON logs to identify network threats, suspicious egress, and protocol anomalies. Use when a user provides Suricata logs, asks for network traffic analysis, or needs to hunt for C2 beaconing and data exfiltration.
 metadata:
   author: "Security Engineering Team"
-  version: "1.2.0"
+  version: "1.4.0"
   tags: ["suricata", "nsm", "threat-hunting", "network-security"]
 ---
 
@@ -12,63 +12,44 @@ metadata:
 ## Instructions
 
 ### Conventions
-- **Input file**: The EVE log's filename is not fixed — it may be `eve.json` or a
-  rotated/timestamped name like `eve-2026-01-21-01.json`.
+- **Input file**: Treat the bare filename listed by the runner as authoritative. Never assume a
+  filename or derive one from a naming convention.
 - **Script prefix**: Reusable scripts use the `suricata_` prefix, e.g. `suricata_tls_sni.py`,
   `suricata_egress_volume.py`.
 
 (The sandbox mechanics, script-reuse pattern, and workspace conventions that apply here are in
 the runtime notes prepended to these instructions — see those before writing any code.)
 
-### Step 1: Initial Discovery
-1.  **Find the input file**: The runner lists available input files (read-only, mounted at
-    `/data`) at the start of your prompt — use that exact filename as `/data/<filename>` in
-    `run_code`. The FileSystem tool's `list_directory` only sees the task workspace, not `/data`,
-    so it cannot be used to discover input files; if you need to re-confirm what's there, list it
-    from inside `run_code` with `pathlib.Path("/data").iterdir()`. Separately, call
-    `list_directory(path='.')` (the FileSystem tool) to check the task workspace itself for any
-    existing `suricata_*.py` scripts and `analyst_log-*.md` reports — per "Reuse Before Rewrite"
-    in the runtime notes — before writing anything new.
-2.  **Sample the Data**: Always begin by sampling the logs to understand the schema and volume.
-    ```python
-    import json
-    import pathlib
+### Step 1: Initial Discovery — Host-Side Query Tools First
+1.  **Find the input and reusable state**: The runner lists the input's bare filename at the
+    start of the prompt. Use that exact value as `name` for the query tools; do not pass a path.
+    Call `list_directory(path='.')` to check the task workspace for existing `suricata_*.py`
+    scripts and `analyst_log-*.md` reports before writing anything new.
+2.  **Batch initial discovery**: In one `run_code` call, call `describe_events` and
+    `aggregate_events(group_by=["event_type"])`, then return a compact summary. Retain the
+    schema inside that call, but return dtype details only for fields relevant to the next query;
+    do not emit the complete schema. Bundle independent baseline queries in that same call.
+    Use at most two `run_code` calls before the first user-facing checkpoint.
+3.  **Establish exact baseline counts**: Use `aggregate_events` with appropriate filters for
+    complete-dataset totals. Do not count records in sandbox Python.
+4.  **Inspect bounded examples only when needed**: Use `query_events` with a small `limit` and
+    explicit top-level `columns` when representative rows are needed. A page is not a
+    complete-dataset result. Query only event types present in the baseline aggregation.
+5.  **Use the query interface correctly**: `query_events(columns=...)` accepts top-level column
+    names only (for example, `"tls"`, not `"tls.sni"`). Use `query_sql` for nested fields,
+    correlations, or window/statistical analysis. Use typed tools for simple counts and exact
+    groupings.
+6.  **Keep tool use compact**: Do not narrate each sample or query while discovering the data.
+    Gather independent evidence in the same `run_code` call, then provide one concise checkpoint
+    with findings and the next investigative choice.
+7.  **Consult references as needed**: For detailed field mapping, read
+    `/skill/references/eve_format.md` from inside `run_code`.
 
-    sampled = 0
-    f = pathlib.Path("/data/eve.json").open()  # use the filename the runner listed in the prompt
-    while True:
-        line = f.readline()
-        if not line:
-            break
-        if not line.strip():
-            continue
-        print(json.dumps(json.loads(line), indent=2))
-        sampled += 1
-        if sampled == 5:
-            break
-    f.close()
-    ```
-3.  **Identify Event Types**: Determine which protocols are present.
-    ```python
-    import json
-    import pathlib
-
-    event_types: dict[str, int] = {}
-    f = pathlib.Path("/data/eve.json").open()  # use the filename the runner listed in the prompt
-    while True:
-        line = f.readline()
-        if not line:
-            break
-        if line.strip():
-            event_type = json.loads(line).get("event_type", "unknown")
-            event_types[event_type] = event_types.get(event_type, 0) + 1
-    f.close()
-
-    for event_type, count in sorted(event_types.items(), key=lambda kv: -kv[1]):
-        print(count, event_type)
-    ```
-4.  **Consult References**: For detailed field mapping, read `/skill/references/eve_format.md`
-    from inside `run_code` (e.g. `pathlib.Path("/skill/references/eve_format.md").read_text()`).
+**Do not open or iterate the raw NDJSON log with `pathlib`/`json` for discovery, counts,
+filtering, aggregation, or repeated protocol hunts.** The host-side query tools run against the
+complete cached dataset and are the required default. Only use direct parsing for a narrowly
+scoped operation that the tools demonstrably cannot express; state that limitation and read the
+smallest possible subset.
 
 ### Step 2: Targeted Analysis
 1.  **Filter Noise**: Ignore `stats` events and focus on external traffic.
@@ -80,16 +61,18 @@ the runtime notes prepended to these instructions — see those before writing a
 ### Example 1: Hunting for Rare SNIs
 **User says**: "Check for suspicious TLS connections."
 **Action**:
-1. Filter for `event_type: "tls"`.
-2. Extract `tls.sni` and count occurrences.
-3. Highlight SNIs that appear fewer than 3 times across the dataset.
+1. In the initial discovery call, retain `describe_events` output and extract the TLS field shape
+   needed for the query.
+2. Use `query_sql` to extract `tls.sni` and count it over the complete dataset.
+3. Highlight SNIs that appear fewer than 3 times, then use `query_events` with top-level columns
+   such as `"tls"` to inspect a bounded set of the corresponding connections.
 
 ### Example 2: Volume-based Exfiltration
 **User says**: "Find any hosts sending large amounts of data to the internet."
 **Action**:
-1. Query `event_type: "flow"`.
-2. Sum `bytes_toserver` by `src_ip` where `dest_ip` is external.
-3. Calculate Producer-Consumer Ratio (PCR).
+1. Call `describe_events` to confirm the flow-byte field names.
+2. Use `query_sql` to sum outbound bytes by source where the destination is external.
+3. Calculate Producer-Consumer Ratio (PCR) in SQL or from the returned aggregate rows.
 
 ## Troubleshooting
 

@@ -21,6 +21,7 @@ from pydantic_monty import MountDir, OSAccess
 from . import data_tools
 from .audit import AuditLog, install_sigterm_handler, restore_sigterm_handler
 from .config import RunOptions, load_model_catalog
+from .phase_budget import InteractivePhaseBudget
 from .resilience import build_overflow_capability, build_provider_hooks
 from .script_lint import lint_and_fix_scripts
 
@@ -281,7 +282,9 @@ def _build_instructions(skill_path: Path, *, interactive: bool) -> str:
         "- Ask: 'Continue with [next analysis]?' (yes/no/focus on X instead)\n\n"
         "Do NOT assume the user wants exhaustive analysis. Keep analysis scope under user control. "
         "If user says 'no', wrap up with what you have. If they say 'focus on X', pivot to that. "
-        "Multiple short checkpoints are better than one long silent analysis."
+        "Multiple short checkpoints are better than one long silent analysis. The initial "
+        "discovery pass has a runner-enforced limit of two run_code calls; use them for the "
+        "highest-value grouped questions, then return a concise checkpoint."
     )
 
 
@@ -381,6 +384,7 @@ def _build_agent(
 ) -> Agent:
     query_events_tool, aggregate_events_tool, describe_events_tool, query_sql_tool = _build_data_tools(context)
     capabilities: list[Any] = [
+        InteractivePhaseBudget(audit=audit, status=sink.status),
         FileSystem(root_dir=str(context.ws_path)),
         CodeMode(
             tools=["describe_events", "query_events", "aggregate_events", "query_sql"],

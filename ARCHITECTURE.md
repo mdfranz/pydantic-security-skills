@@ -24,6 +24,7 @@ flowchart TB
         CM["CodeMode capability"]
         Overflow["OverflowingToolOutput capability"]
         ProviderHooks["Provider hooks\none bounded 429 retry"]
+        PhaseBudget["Interactive phase budget\ninitial discovery boundary"]
         Think["Thinking capability (optional)"]
         Mem["Memory capability\n(accumulate mode only)"]
         TaskWs[("Task workspace\nworkspace/<task>/")]
@@ -44,6 +45,7 @@ flowchart TB
         Agent --> CM
         Agent --> Overflow
         Agent --> ProviderHooks
+        Agent -.-> PhaseBudget
         Agent -.-> Think
         Agent -.-> Mem
         Agent -- "registered tools\n(sandboxed via CodeMode.tools=[...])" --> DataTools
@@ -101,6 +103,12 @@ and dispatch to one of two UI drivers. The application code behind it is divided
   `--max-turns` (`UsageLimits.request_limit`, passed to `agent.run`/`run_sync`), and
   `--max-run-seconds` (a wall-clock watchdog started before and cancelled after each turn — see
   `audit.py` below).
+- **`phase_budget.py`** is a capability-level guard for interactive sessions. `RunSession` marks
+  only the first submitted interactive turn as the initial phase; that fresh capability instance
+  permits two `run_code` executions, audits the boundary, and skips further sandbox calls with a
+  checkpoint instruction. If the next model response tries another tool rather than returning a
+  checkpoint, it ends the run with a deterministic checkpoint result. Follow-up turns are not
+  capped by this initial-phase guard because their scope has already been selected by the user.
 - **`artifacts.py`** owns the structured `Turn`/`Transcript` model, pure report rendering, and
   durable report/generated-code writes.
 - **`audit.py`** owns the append-only log, translates streamed pydantic-ai events into the shared
@@ -118,7 +126,9 @@ neither produces different artifacts or a different event vocabulary, they just 
 differently:
 
 - **`skill_runner/console_ui.py`** (`ConsoleSink`, `run_console`) — today's behavior: raw `print()`s to a flat
-  terminal, plus a blocking `input()` checkpoint loop under `--interactive`. Still calls
+  terminal, plus a blocking `input()` checkpoint loop under `--interactive`. While an interactive
+  turn is running, streamed model text is labelled a draft; the final response is printed only
+  once `RunSession` returns control. Still calls
   `agent.run_sync` synchronously; nothing here is async.
 - **`skill_runner/ui_textual.py`** (`TextualSink`, `AnalystApp`, `run_textual`) — a multi-panel TUI (a
   `DataTable` pairing tool calls with their results by `tool_call_id`, a `RichLog` for model

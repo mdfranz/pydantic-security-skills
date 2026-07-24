@@ -80,7 +80,8 @@ class TextualSink:
     def emit(self, kind: str, **fields: object) -> None:
         table = self.app.tool_table
         if kind == "model_text":
-            self.app.output_log.write(f"[bold]Agent:[/bold] {fields['content']}")
+            label = "Agent (draft)" if self.app.setup.options.interactive else "Agent"
+            self.app.output_log.write(f"[bold]{label}:[/bold] {fields['content']}")
         elif kind == "model_thinking":
             self.app.output_log.write(f"[dim]Agent (thinking): {fields['content']}[/dim]")
         elif kind == "run_code_call":

@@ -11,6 +11,7 @@ from pydantic_ai.usage import UsageLimits
 from .artifacts import Transcript, Turn, write_artifacts
 from .audit import RunInterrupted, make_event_stream_handler, restore_sigterm_handler, start_turn_watchdog
 from .run_core import RunSetup, RunSink
+from .phase_budget import INITIAL_INTERACTIVE_PHASE, INTERACTIVE_PHASE_METADATA_KEY
 from .script_lint import lint_and_fix_scripts
 
 
@@ -85,9 +86,12 @@ class RunSession:
         return effective_prompt
 
     def _run_kwargs(self, model: str | None = None) -> dict[str, Any]:
+        metadata = dict(self.setup.run_metadata)
+        if self.setup.options.interactive and not self.has_successful_turns:
+            metadata[INTERACTIVE_PHASE_METADATA_KEY] = INITIAL_INTERACTIVE_PHASE
         kwargs: dict[str, Any] = {
             "event_stream_handler": self.stream_handler,
-            "metadata": self.setup.run_metadata,
+            "metadata": metadata,
         }
         if self.message_history is not None:
             kwargs["message_history"] = self.message_history

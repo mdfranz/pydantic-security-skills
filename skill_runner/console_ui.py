@@ -23,15 +23,16 @@ class ConsoleSink:
     """status() = plain print; emit() reproduces today's exact _echo(label, content)
     output per event kind, verbatim."""
 
-    def __init__(self, debug: bool = False):
+    def __init__(self, debug: bool = False, *, interactive: bool = False):
         self.debug = debug
+        self.interactive = interactive
 
     def status(self, message: str) -> None:
         print(message, flush=True)
 
     def emit(self, kind: str, **fields: object) -> None:
         if kind == "model_text":
-            _echo("Agent", fields["content"], self.debug)
+            _echo("Agent (draft)" if self.interactive else "Agent", fields["content"], self.debug)
         elif kind == "model_thinking":
             _echo("Agent Thinking", fields["content"], self.debug)
         elif kind == "run_code_call":
@@ -85,7 +86,7 @@ def build_continuation_prompt(action: CheckpointAction) -> str | None:
 def run_console(skill_dir: str, prompt: str, options: RunOptions) -> None:
     """Today's console behavior, preserved byte-for-byte: agent.run_sync, a blocking
     input() checkpoint loop under --interactive, and the same artifact/report shape."""
-    sink = ConsoleSink(debug=options.debug)
+    sink = ConsoleSink(debug=options.debug, interactive=options.interactive)
     setup = prepare_run(skill_dir, prompt, options, sink)
 
     try:

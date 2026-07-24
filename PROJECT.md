@@ -917,3 +917,46 @@ thinking mode, observability/debug flags, and explicitly configured run limits. 
 remain promptless so the input bar supplies the first resumed turn. Added parser round-trip tests
 for both console and Textual commands.
 
+---
+
+### Phase 24: Host-Side Query-First Suricata Discovery (2026-07-23, uncommitted)
+
+**Problem found from a live DeepSeek Flash run:** The skill's own Initial Discovery instructions
+required raw line-by-line NDJSON sampling and event-type counting. That contradicted the runtime
+guidance to prefer the host-side Polars/DuckDB tools, and the model followed the skill by making
+repeated full-file `pathlib`/`json` scans instead of using complete-dataset queries.
+
+**Fix:** Rewrote the skill to make `describe_events`, `aggregate_events`, `query_events`, and
+`query_sql` the required discovery sequence. Raw parsing is now an explicitly justified,
+narrowly scoped exception; the skill no longer assumes an input filename.
+
+---
+
+### Phase 25: Compact Discovery and Monty Format Diagnostics (2026-07-23, uncommitted)
+
+**Problem found from follow-up live runs:** Tool-first discovery avoided raw scans but could still
+spend many model turns issuing small sequential queries. Full schema output was unnecessarily
+large, and generated reusable scripts could retain comma thousands-separator f-string formats
+that Monty rejects.
+
+**Fix:** Instructed the Suricata skill to batch independent discovery queries, return compact
+schema details, limit pre-checkpoint code calls, query only observed event types, and use SQL for
+nested fields. Extended script linting with a line-specific warning for unsupported f-string comma
+format specifications, with regression coverage.
+
+---
+
+### Phase 26: Runner-Enforced Initial Interactive Checkpoint (2026-07-23, uncommitted)
+
+**Problem found from Qwen and other strong-model interactive traces:** A checkpoint-looking streamed
+message is not a control-flow boundary. The UI cannot accept input until `agent.run` returns, so a
+model that ignores the prompt can continue issuing sandbox calls well beyond its stated initial
+checkpoint.
+
+**Fix:** Added `InteractivePhaseBudget`, a per-run Pydantic AI capability enabled only for an
+interactive session's first submitted turn. It permits two `run_code` calls, audits the boundary,
+and returns a normal tool result instructing the model to write a concise checkpoint. If the model
+then attempts another tool instead, the capability ends the turn with a deterministic automatic
+checkpoint rather than treating the budget as a failed request limit. The console and Textual UIs
+now label streamed interactive text as a draft until the completed result returns control. Later
+user-directed turns are deliberately outside this initial MVP budget.

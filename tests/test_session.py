@@ -92,6 +92,19 @@ class RunSessionTests(unittest.TestCase):
             self.assertEqual(audit.events[-1], ("run_end", {"status": "completed"}))
             self.assertTrue(audit.closed)
 
+    def test_interactive_first_turn_carries_initial_phase_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            audit = FakeAudit()
+            options = RunOptions(model="provider:model", workspace=workspace, interactive=True)
+            setup = self.make_setup(workspace, FakeAgent(["one", "two"]), audit, options=options)
+            session = RunSession(setup, FakeSink(), checkpoint_each_turn=False)
+
+            self.assertEqual(session._run_kwargs()["metadata"]["interactive_phase"], "initial")
+            session.submit_sync("first")
+            self.assertNotIn("interactive_phase", session._run_kwargs()["metadata"])
+            session.close()
+
     def test_later_failure_marks_whole_session_failed(self):
         with tempfile.TemporaryDirectory() as directory:
             audit = FakeAudit()
