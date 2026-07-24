@@ -1,9 +1,9 @@
 """Runner-enforced phase boundaries for interactive analysis sessions.
 
 Prompt-only checkpoints are advisory: a model can keep emitting tool calls before an
-``agent.run`` invocation returns control to either UI.  This capability makes the first
-interactive discovery pass a real boundary by allowing only a small number of sandbox
-executions, then returning a normal checkpoint instead of a usage-limit failure.
+``agent.run`` invocation returns control to either UI. This capability makes every
+interactive phase a real boundary by allowing a small number of sandbox executions,
+then returning a normal checkpoint instead of a usage-limit failure.
 """
 
 from __future__ import annotations
@@ -24,22 +24,27 @@ from .audit import AuditLog
 
 INTERACTIVE_PHASE_METADATA_KEY = "interactive_phase"
 INITIAL_INTERACTIVE_PHASE = "initial"
+FOLLOWUP_INTERACTIVE_PHASE = "followup"
 INITIAL_INTERACTIVE_RUN_CODE_LIMIT = 2
+FOLLOWUP_INTERACTIVE_RUN_CODE_LIMIT = 4
+INTERACTIVE_PHASE_RUN_CODE_LIMITS = {
+    INITIAL_INTERACTIVE_PHASE: INITIAL_INTERACTIVE_RUN_CODE_LIMIT,
+    FOLLOWUP_INTERACTIVE_PHASE: FOLLOWUP_INTERACTIVE_RUN_CODE_LIMIT,
+}
 
 
 @dataclass
 class InteractivePhaseBudget(AbstractCapability[Any]):
-    """Cap sandbox calls in the first interactive turn and force a usable checkpoint.
+    """Cap sandbox calls in every interactive turn and force a usable checkpoint.
 
     ``for_run`` returns a fresh instance so concurrent agent runs never share counters.
-    Later interactive follow-ups deliberately remain uncapped in this first MVP: their
-    scope is selected by the user at the preceding checkpoint.
     """
 
     audit: AuditLog
     status: Callable[[str], None]
     run_code_limit: int = INITIAL_INTERACTIVE_RUN_CODE_LIMIT
     _enabled: bool = field(default=False, init=False, repr=False)
+    _phase: str | None = field(default=None, init=False, repr=False)
     _run_code_calls: int = field(default=0, init=False, repr=False)
     _budget_reached: bool = field(default=False, init=False, repr=False)
     _checkpoint_forced: bool = field(default=False, init=False, repr=False)
@@ -51,7 +56,10 @@ class InteractivePhaseBudget(AbstractCapability[Any]):
     async def for_run(self, ctx: RunContext[Any]) -> InteractivePhaseBudget:
         phase = (ctx.metadata or {}).get(INTERACTIVE_PHASE_METADATA_KEY)
         per_run = replace(self)
-        per_run._enabled = phase == INITIAL_INTERACTIVE_PHASE
+        if isinstance(phase, str) and phase in INTERACTIVE_PHASE_RUN_CODE_LIMITS:
+            per_run._enabled = True
+            per_run._phase = phase
+            per_run.run_code_limit = INTERACTIVE_PHASE_RUN_CODE_LIMITS[phase]
         return per_run
 
     async def before_tool_execute(
@@ -73,12 +81,12 @@ class InteractivePhaseBudget(AbstractCapability[Any]):
             self._budget_reached = True
             self.audit.event(
                 "phase_budget_reached",
-                phase=INITIAL_INTERACTIVE_PHASE,
+                phase=self._phase,
                 run_code_calls=self._run_code_calls,
                 run_code_limit=self.run_code_limit,
             )
             self.status(
-                "Initial discovery budget reached after "
+                f"{self._phase_label()} budget reached after "
                 f"{self.run_code_limit} run_code call(s); returning a checkpoint."
             )
 
@@ -107,7 +115,7 @@ class InteractivePhaseBudget(AbstractCapability[Any]):
                 self._checkpoint_forced = True
                 self.audit.event(
                     "phase_checkpoint_forced",
-                    phase=INITIAL_INTERACTIVE_PHASE,
+                    phase=self._phase,
                     run_code_calls=self._run_code_calls,
                     run_code_limit=self.run_code_limit,
                 )
@@ -116,14 +124,19 @@ class InteractivePhaseBudget(AbstractCapability[Any]):
 
     def _tool_budget_message(self) -> str:
         return (
-            "Interactive initial-discovery budget reached. Do not call more tools in this "
-            "turn. Return a concise checkpoint with completed findings, the evidence limits, "
-            "and the next proposed question for the user."
+            f"The {self._phase_label().lower()} budget reached its {self.run_code_limit}-call "
+            "limit. Do not call more tools in this turn. Return a concise checkpoint with "
+            "completed findings, the evidence limits, and the next proposed question for the user."
         )
 
     def _automatic_checkpoint(self) -> str:
         return (
-            "Automatic checkpoint: the interactive initial-discovery budget was reached "
+            f"Automatic checkpoint: the {self._phase_label().lower()} budget was reached "
             f"after {self.run_code_limit} run_code calls. Completed tool results are preserved "
             "above. Continue to begin the next phase, or focus the next phase on a specific question."
         )
+
+    def _phase_label(self) -> str:
+        if self._phase == INITIAL_INTERACTIVE_PHASE:
+            return "Initial discovery"
+        return "Interactive follow-up"

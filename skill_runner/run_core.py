@@ -282,9 +282,9 @@ def _build_instructions(skill_path: Path, *, interactive: bool) -> str:
         "- Ask: 'Continue with [next analysis]?' (yes/no/focus on X instead)\n\n"
         "Do NOT assume the user wants exhaustive analysis. Keep analysis scope under user control. "
         "If user says 'no', wrap up with what you have. If they say 'focus on X', pivot to that. "
-        "Multiple short checkpoints are better than one long silent analysis. The initial "
-        "discovery pass has a runner-enforced limit of two run_code calls; use them for the "
-        "highest-value grouped questions, then return a concise checkpoint."
+        "Multiple short checkpoints are better than one long silent analysis. The runner enforces "
+        "a two-run_code-call initial discovery pass and four-run_code-call user-directed follow-up "
+        "phases; use each budget for the highest-value grouped questions, then return a concise checkpoint."
     )
 
 

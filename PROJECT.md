@@ -960,3 +960,18 @@ then attempts another tool instead, the capability ends the turn with a determin
 checkpoint rather than treating the budget as a failed request limit. The console and Textual UIs
 now label streamed interactive text as a draft until the completed result returns control. Later
 user-directed turns are deliberately outside this initial MVP budget.
+
+---
+
+### Phase 27: Runner-Enforced Follow-Up Checkpoints (2026-07-23, uncommitted)
+
+**Problem found from a Qwen 3.7 Max live run:** The initial two-call boundary worked, but a
+user-selected DNS-hunting follow-up made 16 further `run_code` calls and 17 model requests before
+returning control. The local audit and Logfire trace attributed 263.1 seconds to model calls and
+only 4.4 seconds to tools, so the remaining unbounded follow-up loop—not data-query latency—was
+the cause.
+
+**Fix:** Extended `InteractivePhaseBudget` to every interactive turn. Initial discovery remains
+limited to two `run_code` calls; each later user-directed follow-up is limited to four. Exhaustion
+still produces a successful checkpoint (or a deterministic automatic checkpoint if the model
+tries another tool), preserving completed evidence and returning control to the user.

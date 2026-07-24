@@ -11,7 +11,7 @@ from pydantic_ai.usage import UsageLimits
 from .artifacts import Transcript, Turn, write_artifacts
 from .audit import RunInterrupted, make_event_stream_handler, restore_sigterm_handler, start_turn_watchdog
 from .run_core import RunSetup, RunSink
-from .phase_budget import INITIAL_INTERACTIVE_PHASE, INTERACTIVE_PHASE_METADATA_KEY
+from .phase_budget import FOLLOWUP_INTERACTIVE_PHASE, INITIAL_INTERACTIVE_PHASE, INTERACTIVE_PHASE_METADATA_KEY
 from .script_lint import lint_and_fix_scripts
 
 
@@ -87,8 +87,10 @@ class RunSession:
 
     def _run_kwargs(self, model: str | None = None) -> dict[str, Any]:
         metadata = dict(self.setup.run_metadata)
-        if self.setup.options.interactive and not self.has_successful_turns:
-            metadata[INTERACTIVE_PHASE_METADATA_KEY] = INITIAL_INTERACTIVE_PHASE
+        if self.setup.options.interactive:
+            metadata[INTERACTIVE_PHASE_METADATA_KEY] = (
+                FOLLOWUP_INTERACTIVE_PHASE if self.has_successful_turns else INITIAL_INTERACTIVE_PHASE
+            )
         kwargs: dict[str, Any] = {
             "event_stream_handler": self.stream_handler,
             "metadata": metadata,

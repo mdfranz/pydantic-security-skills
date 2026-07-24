@@ -483,3 +483,18 @@ project already queries for analysis — verified end-to-end with a real `logfir
 
 All 58 tests (`test_data_tools.py` + `test_run_core.py`) pass unchanged; this is logging only, no
 behavior change.
+
+## 16. [Mitigated] Interactive follow-up phases could ignore the checkpoint contract indefinitely
+
+A Qwen 3.7 Max run on 2026-07-24 demonstrated that an initial-phase boundary alone is
+insufficient. It correctly used two `run_code` calls and returned an initial checkpoint, but after
+the user chose a DNS-hunting focus it issued 16 more `run_code` calls and 17 model requests before
+returning control. The matching Logfire trace attributed 263.1 seconds to model calls and only
+4.4 seconds to all tool spans: the problem was an unbounded model loop, not DuckDB/Polars latency.
+
+**Mitigation shipped:** `InteractivePhaseBudget` now applies to every interactive turn. The first
+discovery phase permits two `run_code` calls; each later user-directed phase permits four. When a
+phase reaches its cap, the next sandbox call is skipped with a checkpoint instruction. If the
+model continues by attempting another tool, the runner returns a deterministic successful
+checkpoint instead of failing the session. This preserves the completed evidence while restoring
+user control.

@@ -8,6 +8,7 @@ from pydantic_ai.messages import ModelResponse, ToolCallPart
 from pydantic_graph import End
 
 from skill_runner.phase_budget import (
+    FOLLOWUP_INTERACTIVE_PHASE,
     INITIAL_INTERACTIVE_PHASE,
     INTERACTIVE_PHASE_METADATA_KEY,
     InteractivePhaseBudget,
@@ -53,14 +54,28 @@ class InteractivePhaseBudgetTests(unittest.TestCase):
         )
         self.assertEqual(len(self.statuses), 1)
 
-    def test_followup_phase_does_not_apply_initial_budget(self):
-        budget = asyncio.run(self.make_budget().for_run(SimpleNamespace(metadata={})))
+    def test_followup_phase_allows_four_run_code_calls_then_skips(self):
+        budget = asyncio.run(
+            self.make_budget().for_run(
+                SimpleNamespace(metadata={INTERACTIVE_PHASE_METADATA_KEY: FOLLOWUP_INTERACTIVE_PHASE})
+            )
+        )
         call = ToolCallPart(tool_name="run_code", args={"code": "pass"})
 
-        for _ in range(3):
+        for _ in range(4):
             self.assertEqual(asyncio.run(budget.before_tool_execute(None, call=call, tool_def=None, args={})), {})
+        with self.assertRaises(SkipToolExecution):
+            asyncio.run(budget.before_tool_execute(None, call=call, tool_def=None, args={}))
 
-        self.assertEqual(self.audit.events, [])
+        self.assertEqual(
+            self.audit.events,
+            [
+                (
+                    "phase_budget_reached",
+                    {"phase": "followup", "run_code_calls": 4, "run_code_limit": 4},
+                )
+            ],
+        )
 
     def test_non_sandbox_tool_does_not_consume_budget(self):
         budget = asyncio.run(

@@ -138,9 +138,10 @@ Flags:
 - `--logfire` — traces the run with [Logfire](https://pydantic.dev/logfire). Prints a live span tree to the console with zero setup (suppressed under `--ui textual`, so it doesn't corrupt the TUI's alternate screen); also ships to the Logfire UI once authenticated (see below).
 - `--interactive` — adds checkpoint instructions and makes the first discovery pass a real
   runner boundary: it permits up to two `run_code` calls, then returns a checkpoint to the UI.
-  In console mode this also drives a blocking continue/stop/focus loop after each response;
-  under `--ui textual` the bottom bar accepts the next free-text follow-up. Streamed interactive
-  text is labelled a draft until the turn has actually ended.
+  Each later user-directed phase is similarly capped at four `run_code` calls. In console mode
+  this also drives a blocking continue/stop/focus loop after each response; under `--ui textual`
+  the bottom bar accepts the next free-text follow-up. Streamed interactive text is labelled a
+  draft until the turn has actually ended.
 - `--thinking` — enables model thinking/reasoning with a specified effort level (`low`, `medium`, `high`, `xhigh`). Useful for complex reasoning tasks on supporting models (e.g. Gemini 3+ / Claude Opus 4.6+).
 - `--max-tokens` — the maximum number of tokens to generate before stopping. Defaults to automatically scaling when thinking effort is set, preventing Anthropic API validation errors.
 - `--max-retries` — max retries for a failing `run_code` call before the turn aborts (default `5`). Raised from `CodeMode`'s own default of 3 after a model got stuck retrying the same Monty-unsupported syntax repeatedly; see [`ISSUES.md`](ISSUES.md) #5.

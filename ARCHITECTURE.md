@@ -104,11 +104,11 @@ and dispatch to one of two UI drivers. The application code behind it is divided
   `--max-run-seconds` (a wall-clock watchdog started before and cancelled after each turn — see
   `audit.py` below).
 - **`phase_budget.py`** is a capability-level guard for interactive sessions. `RunSession` marks
-  only the first submitted interactive turn as the initial phase; that fresh capability instance
-  permits two `run_code` executions, audits the boundary, and skips further sandbox calls with a
-  checkpoint instruction. If the next model response tries another tool rather than returning a
-  checkpoint, it ends the run with a deterministic checkpoint result. Follow-up turns are not
-  capped by this initial-phase guard because their scope has already been selected by the user.
+  the first submitted turn as initial and every later submitted turn as a follow-up; each fresh
+  capability instance permits two or four `run_code` executions respectively, audits the boundary,
+  and skips further sandbox calls with a checkpoint instruction. If the next model response tries
+  another tool rather than returning a checkpoint, it ends the run with a deterministic checkpoint
+  result.
 - **`artifacts.py`** owns the structured `Turn`/`Transcript` model, pure report rendering, and
   durable report/generated-code writes.
 - **`audit.py`** owns the append-only log, translates streamed pydantic-ai events into the shared

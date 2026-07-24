@@ -102,7 +102,7 @@ class RunSessionTests(unittest.TestCase):
 
             self.assertEqual(session._run_kwargs()["metadata"]["interactive_phase"], "initial")
             session.submit_sync("first")
-            self.assertNotIn("interactive_phase", session._run_kwargs()["metadata"])
+            self.assertEqual(session._run_kwargs()["metadata"]["interactive_phase"], "followup")
             session.close()
 
     def test_later_failure_marks_whole_session_failed(self):
