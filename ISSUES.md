@@ -519,3 +519,44 @@ expiry, preserve completed tool results and transcript state, emit an explicit l
 and return control to the interactive UI rather than treating the whole process as interrupted.
 Compare provider support and behavior first: cancelling an in-flight request must not corrupt
 message history or leave a provider-side background request running.
+
+## 18. [Upstream] `pydantic-monty` 0.0.19 kills the run when a host tool raises at a multi-line call site
+
+Any exception raised by a host-side tool (`query_sql`, etc.) at a **multi-line** call in `run_code`
+is replaced by a fatal parent-side protocol error instead of reaching the model:
+
+```
+RuntimeError: monty worker protocol error: invalid exception payload:
+invalid value for StackFrame.end.column: 2 is before start column 12
+```
+
+`StackFrame::try_from` in `crates/monty-proto/src/convert/exception.rs` compares `end.column`
+against `start.column` without first comparing the lines, so a frame spanning from the callee name
+on one line to the closing parenthesis on a later line is rejected as malformed. The check was
+added one day before multi-line source previews were, both inside the 0.0.19 release window; its
+"previews only exist for same-line spans" premise was true when written and stale by the next
+commit.
+
+Observed in four runs across two providers (`deepseek-v4-pro`, `google:gemini-3.6-flash`) with
+four distinct underlying exceptions — an unregistered `offset` kwarg, and three DuckDB binder/
+parser errors — each reporting a start column matching its own assignment prefix. The gemini run
+contains a within-session control: a single-line `query_sql` call that raised seconds earlier
+produced a normal `ToolRetryError` the agent recovered from, while the multi-line call ended the
+run. Traces are in the `tomfoolery` Logfire project (e.g. trace
+`019fbafe5a91dbd79225056e95adbde0`); with `--logfire` the masked exception survives on the inner
+`execute_tool query_sql` span even though every ancestor carries only the protocol error.
+
+Impact is worse than lost diagnostics: these are ordinary, recoverable SQL mistakes that the model
+demonstrably fixes on the next turn when it can see them. Here they end the agent run instead.
+
+**Workaround (not a fix)**: `pydantic-monty` 0.0.18 does not have the check and completes these
+runs normally — a verification run finished with exit 0 and 14 `run_code` calls, recovering from a
+binder error at a multi-line call site mid-run. Note that monty cannot be downgraded on its own:
+`pydantic-ai-harness` 0.11.0 raised its `codemode` floor to `pydantic-monty>=0.0.19`, and the 0.0.19
+`Monty` class is a worker pool (`Monty()` + `.checkout()`) while 0.0.18's is a single interpreter
+constructed with the code, so the control ran on harness 0.10.0 + monty 0.0.18.
+
+**Suggested fix (upstream)**: scope the column-order comparison to same-line frames while keeping
+the preview-width bound unconditional — `renderTraceback` in `crates/monty-js/ts/errors.ts` derives
+caret width from the columns without checking the line span, so that bound is still load-bearing.
+Full analysis, reproducer, and patch in [monty-issue-report.md](monty-issue-report.md).
