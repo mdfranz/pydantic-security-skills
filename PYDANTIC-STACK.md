@@ -9,10 +9,10 @@ which covers usage; this covers *why the code is built the way it is*.
 
 | Package | Version (`uv.lock`) | Role here |
 | --- | --- | --- |
-| [`pydantic-ai`](https://ai.pydantic.dev) | 2.11.0 | The `Agent` — model calling, tool-calling loop, message history |
-| [`pydantic-ai-harness`](https://github.com/pydantic/pydantic-ai-harness) | 0.7.0 | `FileSystem` and `CodeMode` capabilities plugged into the `Agent` |
-| [`pydantic-monty`](https://github.com/pydantic/monty) | 0.0.18 | `Monty` — the sandboxed Python interpreter that actually executes model-written code, plus `MountDir`/`OSAccess` |
-| [`logfire`](https://pydantic.dev/logfire) | 4.37.0 | Optional OpenTelemetry tracing of the whole run (`--logfire`) |
+| [`pydantic-ai`](https://ai.pydantic.dev) | 2.20.0 | The `Agent` — model calling, tool-calling loop, message history |
+| [`pydantic-ai-harness`](https://github.com/pydantic/pydantic-ai-harness) | 0.13.0 | `FileSystem` and `CodeMode` capabilities plugged into the `Agent` |
+| [`pydantic-monty`](https://github.com/pydantic/monty) | 0.0.19 | `Monty` — the sandboxed Python interpreter that actually executes model-written code, plus `MountDir`/`OSAccess` |
+| [`logfire`](https://pydantic.dev/logfire) | 4.39.0 | Optional OpenTelemetry tracing of the whole run (`--logfire`) |
 | `pyyaml` | 6.0.3 | Parses `skill.yaml` (structured skill config, if present) |
 
 None of these are used in isolation — the interesting part is how `Agent`, `CodeMode`, and
@@ -114,10 +114,10 @@ under two different views; `/skill` only exists from inside `run_code`.
 CodeMode(
     tools=["describe_events", "query_events", "aggregate_events", "query_sql"],
     mount=[
-        MountDir(SANDBOX_WORKSPACE_MOUNT, str(ws_path), mode="read-write"),
-        MountDir(SANDBOX_SKILL_MOUNT, str(skill_path.resolve()), mode="read-only"),
-        MountDir(SANDBOX_DATA_SOURCE_MOUNT, str(source_root), mode="read-only"),
-        MountDir(SANDBOX_DATA_MOUNT, str(source_root), mode="read-only"),
+        MountDir(host_path=str(ws_path), virtual_path=SANDBOX_WORKSPACE_MOUNT, mode="read-write"),
+        MountDir(host_path=str(skill_path.resolve()), virtual_path=SANDBOX_SKILL_MOUNT, mode="read-only"),
+        MountDir(host_path=str(source_root), virtual_path=SANDBOX_DATA_SOURCE_MOUNT, mode="read-only"),
+        MountDir(host_path=str(source_root), virtual_path=SANDBOX_DATA_MOUNT, mode="read-only"),
     ],
     os_access=OSAccess(environ={}),
 )
@@ -166,10 +166,10 @@ defaults to none.
 
 ```python
 mount=[
-    MountDir("/workspace", str(ws_path), mode="read-write"),
-    MountDir("/skill", str(skill_path.resolve()), mode="read-only"),
-    MountDir("/data-source", str(source_root), mode="read-only"),
-    MountDir("/data", str(source_root), mode="read-only"),
+    MountDir(host_path=str(ws_path), virtual_path="/workspace", mode="read-write"),
+    MountDir(host_path=str(skill_path.resolve()), virtual_path="/skill", mode="read-only"),
+    MountDir(host_path=str(source_root), virtual_path="/data-source", mode="read-only"),
+    MountDir(host_path=str(source_root), virtual_path="/data", mode="read-only"),
 ]
 ```
 

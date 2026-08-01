@@ -975,3 +975,17 @@ the cause.
 limited to two `run_code` calls; each later user-directed follow-up is limited to four. Exhaustion
 still produces a successful checkpoint (or a deterministic automatic checkpoint if the model
 tries another tool), preserving completed evidence and returning control to the user.
+
+### Phase 28: Dependency Upgrade & API Compatibility (2026-07-31)
+
+**Task:** Upgrade python package dependencies across the codebase and ensure full compatibility.
+
+**Changes:**
+- Upgraded the underlying Pydantic AI stack dependencies:
+  - `pydantic-ai` from `2.11.0` to `2.20.0`
+  - `pydantic-ai-harness` from `0.7.0` to `0.13.0`
+  - `pydantic-monty` from `0.0.18` to `0.0.19`
+  - `logfire` from `4.37.0` to `4.39.0`
+- Updated `MountDir` calls in `skill_runner/run_core.py` to use keyword arguments (`host_path` and `virtual_path`) to resolve a `TypeError` signature mismatch introduced in the upgraded version of `pydantic-monty`.
+- Verified that all unit tests pass.
+

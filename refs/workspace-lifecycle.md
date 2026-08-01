@@ -140,13 +140,12 @@ The agent touches the filesystem through four access points, and none of them ca
 
 - `FileSystem(root_dir=workspace/<task>)` — FS tools are rooted at the task subdir and cannot
   traverse above their root.
-- `MountDir("/workspace", workspace/<task>, read-write)` — the sandbox's `pathlib` can reach this
+- `MountDir(host_path=workspace/<task>, virtual_path="/workspace", mode="read-write")` — the sandbox's `pathlib` can reach this
   writable mount, scoped to the task subdir.
-- `MountDir("/data-source", <selected source root>, read-only)` and `MountDir("/data", <same
-  source root>, read-only)` — the same host directory mounted under two virtual paths; sandboxed
+- `MountDir(host_path=<selected source root>, virtual_path="/data-source", mode="read-only")` and `MountDir(host_path=<same source root>, virtual_path="/data", mode="read-only")` — the same host directory mounted under two virtual paths; sandboxed
   code can read canonical evidence, but cannot change it. The FileSystem capability remains rooted
   at the task workspace and cannot reach either.
-- `MountDir("/skill", skills/<name>/, read-only)` — a read-only mount of the current skill dir,
+- `MountDir(host_path=skills/<name>/, virtual_path="/skill", mode="read-only")` — a read-only mount of the current skill dir,
   which lives outside `workspace/` entirely, so it can never expose anything under `workspace/`.
 
 **`workspace/data-sink/parquet/` is deliberately not on this list.** It is never mounted into the

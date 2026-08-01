@@ -11,7 +11,7 @@ In [runner.py](../skill_runner/runner.py), the `Agent` is initialized with two c
 2. `CodeMode(...)` with workspace mounting:
    ```python
    CodeMode(
-       mount=MountDir(SANDBOX_WORKSPACE_MOUNT, str(ws_path), mode="read-write"),
+       mount=MountDir(host_path=str(ws_path), virtual_path=SANDBOX_WORKSPACE_MOUNT, mode="read-write"),
        os_access=OSAccess(environ={}),
    )
    ```
@@ -37,7 +37,7 @@ Under this configuration:
   ```python
   CodeMode(
       tools=[],  # Leaves FileSystem tools visible as normal native tool calls
-      mount=MountDir(SANDBOX_WORKSPACE_MOUNT, str(ws_path), mode="read-write"),
+      mount=MountDir(host_path=str(ws_path), virtual_path=SANDBOX_WORKSPACE_MOUNT, mode="read-write"),
       os_access=OSAccess(environ={}),
   )
   ```
@@ -81,7 +81,7 @@ We can modify the agent instantiation in `runner.py` to:
              FileSystem(root_dir=str(ws_path)),
              CodeMode(
 +                tools=[],  # Keep FileSystem tools native to avoid running Monty for directory listings
-                 mount=MountDir(SANDBOX_WORKSPACE_MOUNT, str(ws_path), mode="read-write"),
+                 mount=MountDir(host_path=str(ws_path), virtual_path=SANDBOX_WORKSPACE_MOUNT, mode="read-write"),
                  # Empty environ keeps host env vars isolated; only the host clock is exposed,
                  # so generated code can timestamp filenames per the skill's naming convention.
                  os_access=OSAccess(environ={}),
