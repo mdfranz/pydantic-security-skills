@@ -2,5 +2,6 @@
 .logfire/
 data/
 workspace/
+evals/.runs/
 __pycache__/
 *.pyc

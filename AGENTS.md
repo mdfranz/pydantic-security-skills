@@ -16,3 +16,11 @@ Only update if they exist.
 # Markdown Coventions
 - Use relative links
 - Never use `file:///`
+
+# Python Python Conventions
+- Use `uv` to install packages and manage virtual environments.
+- Use `uv` to run scripts
+
+
+# Skills
+- Check for pydantic skills and try to use first, but then look for source code in `.venv` prior to searching the web

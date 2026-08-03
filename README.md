@@ -220,3 +220,29 @@ Optional env vars: `SKILL_DIR` (default `skills/suricata-analyst`) and `WORKSPAC
 `./workspace`). One model's failure doesn't abort the others — a summary table at the end maps
 each model to its pristine task id and status, so you can find each run's `analyst_log-*.md`
 under `workspace/<task-id>/` afterward.
+
+## Running evals
+
+`evals/` runs the same model roster through [Pydantic Evals](https://ai.pydantic.dev/evals/)
+against a small, deterministic synthetic fixture with planted findings, instead of the real
+184MB capture `compare_models.sh` uses. The two serve different purposes: `compare_models.sh`
+is for ad hoc, human-read narrative comparisons on real data with no ground truth (see
+`THREAT_MODEL.md`); `evals/` is for repeatable, pass/fail-checked regression comparisons,
+including multiple repeats per model for the statistical confidence a single narrative run
+can't give.
+
+```bash
+# Default 4-model roster, one rep each, no Logfire:
+uv run python -m evals.runner
+
+# 5 reps per model, pushed to the configured Logfire project:
+uv run python -m evals.runner --repeat 5 --logfire
+
+# Override the model roster:
+uv run python -m evals.runner --models "google:gemini-3-flash-preview,anthropic:claude-haiku-4-5"
+```
+
+`evals/` is not a `[project.scripts]` entry — it's deliberately excluded from the built wheel
+(see `[tool.hatch.build.targets.wheel]` in `pyproject.toml`), so it's always run as a module,
+not an installed command. See [`refs/pydantic-evals-plan.md`](refs/pydantic-evals-plan.md) for
+the full design.

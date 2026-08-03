@@ -989,3 +989,123 @@ tries another tool), preserving completed evidence and returning control to the 
 - Updated `MountDir` calls in `skill_runner/run_core.py` to use keyword arguments (`host_path` and `virtual_path`) to resolve a `TypeError` signature mismatch introduced in the upgraded version of `pydantic-monty`.
 - Verified that all unit tests pass.
 
+### Phase 29: Pydantic Evals Harness (2026-08-03)
+
+**Objective:** Replace ad hoc, one-off `results/*.md` model comparisons (repeatedly flagged as
+"3 reps isn't enough for a reliable rate estimate," and unable to establish ground truth against
+the real 184MB capture — see `THREAT_MODEL.md`) with a repeatable, ground-truth-checked
+regression harness, per [`refs/pydantic-evals-plan.md`](refs/pydantic-evals-plan.md) (the design
+source of truth for this phase, not modified).
+
+**New `evals/` package** (dev/test-only, excluded from the built wheel):
+- `fixtures.py` — a small, deterministic synthetic Suricata EVE-JSON generator (~500 rows, no
+  RNG) planting three independently-verifiable findings mirroring the real capture's own
+  documented findings: a 53-hour long-lived flow, a fixed-interval MQTT-port beacon, and a
+  benign high-volume host (a deliberate false-positive trap) — plus `stats` noise. Returns a
+  `FixtureManifest` so evaluators and tests share one source of ground truth instead of
+  duplicating magic strings.
+- `task.py` — `run_skill_eval`, a Pydantic Evals task function built directly on
+  `skill_runner.run_core.prepare_run`/`skill_runner.session.RunSession.submit_async` (the same
+  entrypoints `tests/test_run_core.py`'s `FunctionModel`-driven tests already use), with a
+  test-only `model_override` field enabling the same `FunctionModel`/`TestModel` substitution
+  for eval-harness tests themselves.
+- `evaluators.py` — four case-level `Evaluator`s (`SurfacesPlantedFindings`,
+  `AvoidsBenignFalsePositive`, `WithinToolCallBudget`, `VerdictLabel` — an independent
+  `openai:gpt-5-mini` judge classifying each report's overall verdict) plus two
+  `ReportEvaluator`s that see every rep together via `EvaluationReport.case_groups()`:
+  `CrashRateByCase` and `VerdictConsistencyAcrossReps` (informational — self-consistency across
+  reps, not correctness; directly operationalizes the GLM-5.2 "low risk" → "HIGH confidence,
+  isolate host" flip-flop from `results/pristine-model-comparison-2026-07-19.md`).
+- `dataset_suricata.py` / `runner.py` — a concrete `Dataset` over a 4-model roster (one per
+  provider tier: `google:gemini-3-flash-preview`, `anthropic:claude-haiku-4-5`,
+  `openrouter:deepseek/deepseek-v4-flash`, `openrouter:z-ai/glm-5.2`), and a CLI supporting
+  `--repeat`, `--logfire`, `--models`, `--workspace`.
+
+**Deviation from the plan doc:** the plan proposed a `skill-evals` console-script entry point.
+Adding one turned out to be impossible without also adding `evals` to
+`[tool.hatch.build.targets.wheel]`'s `packages` list, which would have shipped the dev/test-only
+harness inside the installed package — a real either/or the plan hadn't resolved. Kept `evals/`
+wheel-excluded and dropped the console-script entry in favor of `uv run python -m evals.runner`,
+documented in `README.md`/`ARCHITECTURE.md` accordingly.
+
+**Tests:** 25 new tests across `tests/test_evals_{fixtures,task,evaluators,dataset}.py`, all
+passing with zero real model API calls — fixture facts asserted directly against the written
+NDJSON, `run_skill_eval` driven via `FunctionModel`/`TestModel`, evaluators driven via
+hand-built `EvaluatorContext`/`ReportEvaluatorContext`. Full suite: 110/112 pass; the 2 failures
+are pre-existing `test_data_tools.py` failures unrelated to this phase (a macOS `/var` vs.
+`/private/var` symlink-resolution quirk in a file this phase never touched).
+
+**Verified live (`TestModel`):** a full `Dataset.evaluate_sync(repeat=2)` run against
+`model="test"` (`TestModel`) end-to-end confirmed the report shape renders correctly — per-rep
+case naming (`test [1/2]`), the `CrashRateByCase`/`VerdictConsistencyAcrossReps` tables, and a
+`Case Failures` section with real per-rep error detail (`TestModel`'s own default multi-tool-call
+behavior produced expected `FileExistsError`s, not a wiring bug).
+
+**Verified live against real providers, twice, with a real bug found and fixed in between:**
+`uv run python -m evals.runner --repeat 1 --logfire` against the original 4-model roster
+(`google:gemini-3-flash-preview`, `anthropic:claude-haiku-4-5`,
+`openrouter:deepseek/deepseek-v4-flash`, `openrouter:z-ai/glm-5.2`) found two real things
+simultaneously: (1) `google:gemini-3-flash-preview` and `anthropic:claude-haiku-4-5` both
+crashed with the exact `ISSUES.md` #18 upstream `pydantic-monty` protocol error, surfaced
+immediately as `crash_rate: 1.0` rows rather than requiring a manual Logfire scan; (2)
+`AvoidsBenignFalsePositive` itself had a bug — its sentence-splitter required whitespace after
+each `\n`, so it swept an entire markdown table into one "sentence" and falsely failed both
+completed cases (deepseek-v4-flash, glm-5.2) for merely sharing a table with an unrelated
+finding. Fixed the split logic (`evals/evaluators.py`) and added two regression tests
+(`tests/test_evals_evaluators.py`) reproducing the exact false positive and a genuine same-row
+case. A second live run, after the user swapped the roster to an all-OpenRouter set
+(`openrouter:qwen/qwen3.7-flash`, `openrouter:deepseek/deepseek-v4-flash`,
+`openrouter:z-ai/glm-5.2`, `openrouter:deepseek/deepseek-v4-pro`), confirmed the fix — both
+completed cases scored 5/5 assertions — and independently reproduced the *same* `ISSUES.md` #18
+crash on two entirely different models (`qwen3.7-flash`, `deepseek-v4-pro`). Across both runs,
+4 of 8 total cases, spanning four distinct models from three providers, hit the identical
+crash — strong evidence issue #18 is model-agnostic, not incidental to any one provider.
+
+**Result:** `uv run python -m evals.runner --repeat N --logfire` now gives a repeatable,
+statistically-groundable alternative to hand-written model comparisons for the cases the
+synthetic fixture covers, pushing spans into the same `tomfoolery` Logfire project with no
+additional instrumentation call (`pydantic_evals` forwards through `logfire_api` automatically
+once `logfire.configure()` has run). Its first two live runs already paid for themselves: one
+real bug found and fixed in the harness itself, and new, quantified cross-model evidence
+strengthening `ISSUES.md` #18's priority. `compare_models.sh` and `results/*.md` are unchanged
+and remain the path for ad hoc, real-data narrative comparisons.
+
+### Phase 30: Downgrade `pydantic-ai-harness`/`pydantic-monty` to Unblock `ISSUES.md` #18 (2026-08-03)
+
+**Objective:** Act on the evidence Phase 29's live eval runs produced (4 of 8 real cases across
+four models crashing on `ISSUES.md` #18's upstream `pydantic-monty` 0.0.19 protocol error) by
+applying the workaround that issue already documented but had never actually pinned in
+`pyproject.toml`.
+
+**Change:** Pinned `pydantic-ai-harness[codemode]==0.10.0` and, since harness alone doesn't
+constrain its own transitive `pydantic-monty` floor tightly enough, `pydantic-monty==0.0.18`
+directly (previously unpinned/floor-only dependencies, both had drifted to the buggy
+0.13.0/0.0.19 pair via Phase 28's earlier upgrade). Verified before committing to the downgrade
+that `skill_runner/run_core.py`'s current `MountDir(host_path=..., virtual_path=...)` keyword-
+argument call shape (added in Phase 28 for 0.0.19 compatibility) also works unchanged under
+0.0.18 — constructed a `MountDir` both the old positional way and the current keyword way
+directly against the downgraded package and confirmed both succeed — so no code reversion was
+needed, only the two version pins. Updated `PYDANTIC-STACK.md`'s version table and `ISSUES.md`
+#18 accordingly.
+
+**Verified live, three ways:**
+- Full test suite: 114/114 relevant tests pass (same 2 pre-existing, unrelated macOS symlink
+  failures in `test_data_tools.py` as before the downgrade).
+- `uv run python -m evals.runner --repeat 1 --logfire` against the 4-model OpenRouter roster
+  that had reproduced the crash pre-downgrade: **0.0 crash rate across all 4 cases** — the
+  `CrashRateByCase` table that previously showed two `1.0` rows now shows all zeros.
+- The same run surfaced a genuine, correctly-identified model weakness now that crashes weren't
+  masking it: `AvoidsBenignFalsePositive` failed for `deepseek-v4-flash` and `deepseek-v4-pro`
+  (each flagged the fixture's deliberately-planted benign NTP host, `192.168.50.30`, as a
+  "beaconing"/anomalous finding in a single line/table row — a real false positive, not the
+  markdown-table-formatting artifact fixed earlier in this phase), while `qwen3.7-flash` and
+  `glm-5.2` correctly avoided the trap. Confirmed via a direct Logfire query of each case span's
+  `assertions` attribute, not just the console summary's checkmarks.
+
+**Result:** The eval harness went from finding a crash class to verifying its fix, in the same
+session, against real providers — `ISSUES.md` #18 is now actively worked around (not just
+documented) in the pinned dependency set, and the harness immediately produced a new, genuine
+finding (a real false-positive pattern specific to two of the four models) the crashes had
+previously been masking. Re-upgrading past `pydantic-ai-harness` 0.10.0 / `pydantic-monty` 0.0.18 should stay blocked
+until the upstream fix in `monty-issue-report.md` lands or is independently re-verified.
+

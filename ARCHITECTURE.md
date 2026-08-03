@@ -119,6 +119,22 @@ and dispatch to one of two UI drivers. The application code behind it is divided
 None of these modules contains analysis logic or knows what a "suspicious SNI" is. All domain
 knowledge lives in skills.
 
+#### Evals harness (`evals/`)
+
+A separate, dev/test-only package (excluded from the built wheel — see
+`[tool.hatch.build.targets.wheel]` in `pyproject.toml`, which lists only `skill_runner`) that
+drives `run_core.prepare_run`/`session.RunSession` the same way `tests/test_run_core.py`'s
+`FunctionModel`-driven tests do, but through [Pydantic Evals](https://ai.pydantic.dev/evals/)
+instead of a hand-rolled comparison script. Where `compare_models.sh` runs the real, ungrounded
+184MB capture and produces a human-read narrative report (see `results/*.md`), `evals/` runs a
+small deterministic synthetic fixture with *planted, independently-verifiable* findings
+(`evals/fixtures.py`) so `Evaluator`s can assert pass/fail rather than requiring a human to
+`grep` the raw log afterward. `evals/task.py`'s `run_skill_eval` is the one place a
+`FunctionModel`/`TestModel` can be substituted per-case, via `RunSession.submit_async`'s
+`model=` override — the same substitution point the existing integration tests use, not a
+parallel run path. See [`refs/pydantic-evals-plan.md`](refs/pydantic-evals-plan.md) for the full
+design and rationale, and run it via `uv run python -m evals.runner [--repeat N] [--logfire]`.
+
 #### Two UI backends, one `RunSink` contract
 
 `--ui console` (default) and `--ui textual` are two independent *observers* of the same run —
@@ -341,6 +357,10 @@ executions. It doesn't participate in the data flow above — it observes it. It
 value is making capability composition (e.g. whether a tool call landed as a sibling of
 `run_code` or a child of it) empirically checkable rather than something only inferable from
 reading configuration.
+
+`pydantic_evals` (see "Evals harness" above) piggybacks on the same `logfire.configure()` call
+rather than needing separate instrumentation: its own experiment/case spans forward through
+`logfire_api` automatically the moment `logfire.configure()` has run anywhere in the process.
 
 ## Trust boundaries
 

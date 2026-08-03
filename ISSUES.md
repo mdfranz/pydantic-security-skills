@@ -156,6 +156,12 @@ real `skill-runner` entry point never runs through — see #13 for the full stor
 `RunInterrupted` half of that gap is fixed so far; `UnexpectedModelBehavior` itself is still
 uncaught by `main()` and still exits with a raw traceback.
 
+**Update (eval harness)**: `evals/evaluators.py`'s `CrashRateByCase` report evaluator now
+computes a per-model failure rate from `Dataset.evaluate(repeat=N)` directly — this class of
+crash surfaces as a number in `uv run python -m evals.runner`'s report instead of requiring a
+manual project-wide Logfire scan (as this issue's "not a one-off" section did by hand) to
+notice it's recurring. See `refs/pydantic-evals-plan.md`.
+
 ## 6. [Mitigated] `qwen3.6-flash` dumps every Suricata `stats` event verbatim, blowing the context window
 
 During the same `--pristine` comparison matrix, `qwen3.6-flash`'s rep-3 run crashed with:
@@ -194,6 +200,11 @@ can enter model history, leaving a bounded preview and audited read handle. The 
 guidance to aggregate `stats` records remains defense in depth, but a noncompliant model can no
 longer reproduce this context-window failure through one oversized tool return.
 
+**Update (eval harness)**: `evals/fixtures.py`'s synthetic capture deliberately includes `stats`
+noise events specifically so a future `Evaluator` could assert a report never cites stats-derived
+numbers as findings (`SKILL.md` says to ignore them) — not yet wired as its own evaluator, but
+the fixture already carries the raw material for one.
+
 ## 7. Several Monty stdlib/builtin gaps beyond `__name__`/`sys.argv` cost real retries across nearly every session
 
 A project-wide scan of `pydantic_ai.exceptions.ToolRetryError` (72 occurrences total, all time)
@@ -223,6 +234,11 @@ Monty stdlib" allowlist/denylist — even a short one covering `collections`, th
 functions, `socket`/`ipaddress`, and "no `exec`/`eval`" would likely eliminate most of these 72
 retries. This is a documentation gap, not a Monty behavior bug — the restrictions themselves may
 well be intentional sandbox design.
+
+**Update (eval harness)**: `evals/evaluators.py`'s `WithinToolCallBudget` reads the same
+`run_code`/tool-call counts these retries inflate, so a model burning retries on Monty stdlib
+gaps shows up as an evaluated regression (more calls for the same task) in `uv run python -m
+evals.runner`'s report, not just as a raw `ToolRetryError` count found by a manual scan.
 
 ## 8. File objects aren't iterable (`for line in f:`) — recurs despite the documented `readline()` pattern
 
@@ -361,6 +377,13 @@ regardless of cause. And consider a single top-level retry (with the provider's 
 `UnexpectedModelBehavior`/`ModelHTTPError`/`ReadTimeout` clean-exit catch from issue #5's suggested
 fix (broadened here to network exceptions) is still open — only the `RunInterrupted` half of that
 fix shipped as part of #13, since it was a hard blocker for `--max-run-seconds` itself.
+
+**Update (eval harness)**: `evals/task.py`'s `run_skill_eval` lets any of these exceptions
+(network, retry-exhaustion, or otherwise) propagate uncaught by design, so `Dataset.evaluate`
+records them as a native `ReportCaseFailure` and `CrashRateByCase` aggregates them — a silent
+multi-hour hang like kimi-k3's rep 1 would now also be bounded by each case's own
+`max_run_seconds`, turning it into a fast, visible failure in the eval report rather than a
+multi-hour wait discovered only by re-reading an audit log afterward.
 
 ## 13. `RunInterrupted`'s exit-143 mapping never actually ran via the real `skill-runner` entry point — Ctrl+C/SIGTERM crashed with a raw traceback all along
 
@@ -560,3 +583,34 @@ constructed with the code, so the control ran on harness 0.10.0 + monty 0.0.18.
 the preview-width bound unconditional — `renderTraceback` in `crates/monty-js/ts/errors.ts` derives
 caret width from the columns without checking the line span, so that bound is still load-bearing.
 Full analysis, reproducer, and patch in [monty-issue-report.md](monty-issue-report.md).
+
+**Workaround now applied (2026-08-03)**: after the eval harness reproduced this live and
+quantified it at 4/8 cases across four models (see the "Confirmed live" update above),
+`pyproject.toml` now pins `pydantic-ai-harness[codemode]==0.10.0` and `pydantic-monty==0.0.18`
+directly (both previously unpinned/floor-only, resolving to the buggy 0.13.0/0.0.19 pair). The
+`host_path=`/`virtual_path=` `MountDir` keyword-argument call shape added in Phase 28's upgrade
+(`skill_runner/run_core.py`) turned out to already work under 0.0.18 too — confirmed directly by
+constructing a `MountDir` both ways against the downgraded package — so no code reversion was
+needed there, only the two version pins. Re-running the full test suite and a live
+`uv run python -m evals.runner --repeat 1 --logfire` pass under the downgrade is the verification
+for this update; see `PROJECT.md` for the outcome. Re-upgrading past 0.0.19 should stay blocked
+until the upstream fix lands or is independently re-verified not to affect this call pattern.
+
+**Update (eval harness)**: since this regression is upstream and version-triggered rather than
+prompt-triggered, `evals/`'s `CrashRateByCase` report evaluator (run periodically against a
+pinned `pydantic-monty` version) would surface a jump in failure rate the next time a dependency
+upgrade reintroduces a class of protocol-error crash like this one, rather than requiring it to
+be caught by chance during a live trace review.
+
+**Confirmed live (2026-08-03), and worse than previously known**: two real `uv run python -m
+evals.runner --repeat 1 --logfire` runs against the synthetic fixture, across two entirely
+different 4-model rosters, both hit this exact `StackFrame.end.column` protocol error — first
+`google:gemini-3-flash-preview` and `anthropic:claude-haiku-4-5` (2 of 4), then, after swapping
+the roster, `openrouter:qwen/qwen3.7-flash` and `openrouter:deepseek/deepseek-v4-pro` (2 of
+4 again). **4 of 8 total cases across four different models from three different providers** hit
+the identical crash, each triggered by an ordinary recoverable `query_sql` mistake (a missing
+table/struct key) at a multi-line call site — this is not one model's quirk, it's model-agnostic
+and appears to trigger routinely whenever a `query_sql` retry error happens to land on a
+multi-line call. `evals/dataset_suricata.py`'s `CrashRateByCase` table made this visible as a
+plain number (`1.0` per affected case) instead of requiring a manual trace review to notice the
+pattern repeating across unrelated models.
