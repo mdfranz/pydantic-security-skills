@@ -2,8 +2,8 @@
 findings.
 
 Every real model-comparison in `results/*.md` verified specific claims by hand (`grep`-ing the
-raw 184MB capture) because that capture has no independently-confirmed ground truth
-(`THREAT_MODEL.md`). This fixture inverts that: every finding it contains is fixed at
+raw 184MB capture) because that capture has no independently-confirmed ground truth (see those
+reports' own Limitations sections). This fixture inverts that: every finding it contains is fixed at
 generation time, asserted directly in `tests/test_evals_fixtures.py`, and exposed via
 `FixtureManifest` so evaluators never duplicate the underlying facts as separate magic strings.
 
@@ -39,12 +39,26 @@ _BEACON_PORT = 1883
 _BEACON_INTERVAL_SECONDS = 300
 _BEACON_COUNT = 50
 
-# Finding 3: a benign high-volume host -- many distinct external destinations, boring
-# well-known port, no alert signature. A deliberate false-positive trap.
+# Finding 3: a benign, high-connection-count host -- a small, stable, realistic NTP server
+# pool over UDP, no alert signature. A deliberate false-positive trap.
+#
+# An earlier version of this fixture hit 40 *distinct*, never-repeated destination IPs in
+# strict ascending order, at a perfectly uniform interval (stddev 0) with byte-identical
+# payloads, over TCP. Live model runs against that version (see PROJECT.md/ISSUES.md,
+# 2026-08-03) showed every model correctly read that as textbook C2 IP-rotation beaconing --
+# not a false positive on the models' part, a bug in the fixture: real NTP is UDP, not TCP,
+# and a real NTP client polls a small, stable server pool, not 40 distinct hosts. The pattern
+# below fixes both: UDP, a small reused pool, and deterministic (non-RNG) jitter on interval
+# and payload size so it isn't mechanically perfect either -- perfect regularity was itself
+# called out by name in several reports as automation evidence.
 _BENIGN_SRC = "192.168.50.30"
 _BENIGN_PORT = 123
-_BENIGN_DEST_COUNT = 40
-_BENIGN_DEST_PREFIX = "198.51.100."
+_BENIGN_SERVER_POOL = ("198.51.100.1", "198.51.100.2", "198.51.100.3")
+_BENIGN_CONNECTION_COUNT = 30
+_BENIGN_INTERVAL_SECONDS = 300
+_BENIGN_INTERVAL_JITTER_SECONDS = (0, -6, 4, -3, 7, -2)
+_BENIGN_BYTE_JITTER = (0, 2, -1, 3, -2, 1)
+_BENIGN_BASE_BYTES = 48  # a real NTP client/server exchange is a fixed-size ~48-byte packet
 
 _MALICIOUS_KEYWORDS = ("c2", "malicious", "isolate", "compromise", "beacon", "exfil")
 
@@ -72,6 +86,7 @@ class FixtureManifest:
     benign_host_src: str
     benign_host_port: int
     benign_host_dest_count: int
+    benign_host_connection_count: int
 
     malicious_keywords: tuple[str, ...] = _MALICIOUS_KEYWORDS
 
@@ -93,6 +108,7 @@ def _flow_event(
     flow_end: datetime,
     bytes_toserver: int = 4200,
     bytes_toclient: int = 1800,
+    proto: str = "TCP",
 ) -> dict:
     age = int((flow_end - flow_start).total_seconds())
     return {
@@ -102,7 +118,7 @@ def _flow_event(
         "dest_ip": dest_ip,
         "src_port": 51000,
         "dest_port": dest_port,
-        "proto": "TCP",
+        "proto": proto,
         "flow": {
             "start": flow_start.isoformat(),
             "end": flow_end.isoformat(),
@@ -194,21 +210,28 @@ def build_suricata_fixture(dest_dir: Path) -> FixtureManifest:
             )
         )
 
-    # Finding 3: benign high-volume host, many distinct destinations, boring port.
+    # Finding 3: benign, high-connection-count host reusing a small NTP server pool over UDP,
+    # with deterministic jitter on interval and payload size (see the comment on the constants
+    # above for why -- an earlier version of this loop was itself a false-positive generator).
     benign_start = _BASE_TIME - timedelta(hours=6)
-    for i in range(_BENIGN_DEST_COUNT):
-        dest_ip = f"{_BENIGN_DEST_PREFIX}{i + 1}"
-        benign_time = benign_start + timedelta(minutes=i * 5)
+    elapsed_seconds = 0
+    for i in range(_BENIGN_CONNECTION_COUNT):
+        dest_ip = _BENIGN_SERVER_POOL[i % len(_BENIGN_SERVER_POOL)]
+        interval_jitter = _BENIGN_INTERVAL_JITTER_SECONDS[i % len(_BENIGN_INTERVAL_JITTER_SECONDS)]
+        elapsed_seconds += _BENIGN_INTERVAL_SECONDS + interval_jitter
+        benign_time = benign_start + timedelta(seconds=elapsed_seconds)
+        byte_jitter = _BENIGN_BYTE_JITTER[i % len(_BENIGN_BYTE_JITTER)]
         rows.append(
             _flow_event(
                 timestamp=benign_time,
                 src_ip=_BENIGN_SRC,
                 dest_ip=dest_ip,
                 dest_port=_BENIGN_PORT,
+                proto="UDP",
                 flow_start=benign_time,
                 flow_end=benign_time + timedelta(seconds=1),
-                bytes_toserver=90,
-                bytes_toclient=90,
+                bytes_toserver=_BENIGN_BASE_BYTES + byte_jitter,
+                bytes_toclient=_BENIGN_BASE_BYTES + byte_jitter,
             )
         )
 
@@ -246,7 +269,8 @@ def build_suricata_fixture(dest_dir: Path) -> FixtureManifest:
         beacon_count=_BEACON_COUNT,
         benign_host_src=_BENIGN_SRC,
         benign_host_port=_BENIGN_PORT,
-        benign_host_dest_count=_BENIGN_DEST_COUNT,
+        benign_host_dest_count=len(_BENIGN_SERVER_POOL),
+        benign_host_connection_count=_BENIGN_CONNECTION_COUNT,
         expected_findings={
             "long_lived_flow": _LONG_FLOW_DEST,
             "beacon": _BEACON_DEST,

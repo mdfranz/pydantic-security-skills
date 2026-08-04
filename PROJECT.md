@@ -993,9 +993,10 @@ tries another tool), preserving completed evidence and returning control to the 
 
 **Objective:** Replace ad hoc, one-off `results/*.md` model comparisons (repeatedly flagged as
 "3 reps isn't enough for a reliable rate estimate," and unable to establish ground truth against
-the real 184MB capture — see `THREAT_MODEL.md`) with a repeatable, ground-truth-checked
-regression harness, per [`refs/pydantic-evals-plan.md`](refs/pydantic-evals-plan.md) (the design
-source of truth for this phase, not modified).
+the real 184MB capture — see each report's own Limitations section) with a repeatable,
+ground-truth-checked regression harness, per
+[`refs/pydantic-evals-plan.md`](refs/pydantic-evals-plan.md) (the design source of truth for
+this phase, not modified).
 
 **New `evals/` package** (dev/test-only, excluded from the built wheel):
 - `fixtures.py` — a small, deterministic synthetic Suricata EVE-JSON generator (~500 rows, no
@@ -1108,4 +1109,75 @@ documented) in the pinned dependency set, and the harness immediately produced a
 finding (a real false-positive pattern specific to two of the four models) the crashes had
 previously been masking. Re-upgrading past `pydantic-ai-harness` 0.10.0 / `pydantic-monty` 0.0.18 should stay blocked
 until the upstream fix in `monty-issue-report.md` lands or is independently re-verified.
+
+### Phase 31: External Model Roster File for the Eval Suite (2026-08-03)
+
+**Objective:** Stop hardcoding the eval suite's model roster as a Python tuple
+(`evals/dataset_suricata.py`'s `MODEL_ROSTER`) so it can be changed, or swapped between named
+roster files, without a code edit.
+
+**Change:** Added `evals/model_roster.yaml` (a plain `models: [id, ...]` list, holding the
+roster already in use as of Phase 30 — the four-model OpenRouter set). `dataset_suricata.py`
+gained `load_model_roster(path=DEFAULT_ROSTER_PATH) -> tuple[str, ...]`, and `build_dataset`'s
+`models` parameter is now `None` by default, falling back to a new `roster_path` parameter
+(itself defaulting to `DEFAULT_ROSTER_PATH`) rather than embedding the tuple as a literal
+default value. `evals/runner.py` gained `--roster-file PATH`, and its existing `--models
+a,b,c` inline override now takes precedence over `--roster-file` when both are given (mirroring
+how `build_dataset(models=...)` already took precedence over `roster_path`).
+
+**Tests:** Added `LoadModelRosterTests` (default file loads a nonempty tuple; a custom file
+loads correctly; an empty or non-string `models:` list raises) and
+`test_roster_path_overrides_default_file` to `tests/test_evals_dataset.py`. Full suite: 119
+tests, same 2 pre-existing unrelated `test_data_tools.py` failures as every prior phase in this
+session.
+
+**Result:** The roster a `uv run python -m evals.runner` invocation covers is now data
+(`evals/model_roster.yaml` or any file matching its shape), not code — supports keeping several
+named roster files (e.g. a small fast one and a broader one) and selecting between them with
+`--roster-file` instead of editing `dataset_suricata.py`.
+
+### Phase 32: Fix the Benign-Host Fixture, Not the Models (2026-08-03)
+
+**Objective:** Root-cause why `AvoidsBenignFalsePositive` failed for 7 of 8 real models tested
+across two live roster runs (`model_roster.yaml`: 3/4 failed; `expensive_model_roster.yaml`: 4/4
+failed) — instead of assuming the models were simply over-flagging.
+
+**Investigation:** Read each failing report's actual reasoning (from the local
+`analyst_log-*.md` artifacts, since Logfire's scrubber redacted the `output` attribute on a
+false "session" match). Every model independently cited the same two things: (1) the planted
+benign host's flow events were generated with `proto: "TCP"`, but NTP (port 123) is a UDP
+protocol — "TCP fan-out... is not legitimate time sync" — and (2) the host connected to 40
+*distinct*, never-repeated destination IPs in strict ascending order at a perfectly uniform
+5-minute interval with byte-identical payloads, which every model correctly read as a classic
+IP-rotation C2 beacon shape, not real NTP client behavior (a real client polls a small, stable
+server pool). The models were not hallucinating a false positive; they were correctly reading
+data that didn't actually resemble benign traffic — the fixture's "benign" label was wrong, not
+the evaluator or the models.
+
+**Fix (`evals/fixtures.py`):** The benign host now emits `proto="UDP"`, reuses a fixed
+three-server pool (`_BENIGN_SERVER_POOL`) round-robin across 30 connections instead of 40
+never-repeated hosts, and applies deterministic (non-RNG, so the fixture stays reproducible)
+jitter to both the inter-connection interval and the payload byte count via fixed offset
+cycles — removing the "IP rotation" and "mechanically perfect timing" signals several reports
+called out by name as automation evidence, alongside the protocol fix. `FixtureManifest` gained
+`benign_host_connection_count` alongside the now-smaller `benign_host_dest_count`.
+
+**Tests:** Replaced the stale "many distinct destinations" assertion in
+`tests/test_evals_fixtures.py` with `test_benign_host_reuses_a_small_server_pool_over_udp`
+(asserts UDP, a small reused pool, and connection count > distinct destination count) and
+`test_benign_host_timing_and_payload_size_are_not_mechanically_uniform` (asserts intervals and
+byte counts vary — a regression guard against reintroducing the "perfectly uniform" shape). Full
+suite: 120 tests, same 2 pre-existing unrelated `test_data_tools.py` failures.
+
+**Verified live:** re-ran `uv run python -m evals.runner --roster-file
+evals/expensive_model_roster.yaml --repeat 1 --logfire` — the exact roster that had scored 0/4
+clean before the fix — and got **4/4 clean (100% assertion pass rate)**. All four models still
+correctly surfaced the real beacon and long-lived-flow findings as "high-risk"; none flagged the
+fixed benign host.
+
+**Result:** The eval harness's own ground truth is now consistent with what a careful analyst
+would actually conclude from the data, closing the loop from "harness surfaces a suspicious
+100%-failure pattern" (Phase 29-31's live runs) to "root-caused and fixed, confirmed live" in
+the same session — the harness's report_evaluators and per-assertion breakdown were what made
+the pattern visible enough to investigate in the first place.
 

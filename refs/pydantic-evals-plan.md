@@ -10,9 +10,10 @@ raw 184MB Suricata capture. Those reports have repeatedly surfaced the same limi
 all of them ([results/pristine-model-comparison-2026-07-19.md](../results/pristine-model-comparison-2026-07-19.md)) is that **the same model,
 same prompt, same data reaches different security verdicts across reps** (GLM-5.2 flipped
 "low risk" → "HIGH confidence, isolate host" on an identical MQTT beacon in 2 of 3 reps).
-The real capture also has no independently-confirmed ground truth ([THREAT_MODEL.md](../THREAT_MODEL.md)), so
-today's "verification" is limited to checking that specific structural facts (record counts,
-specific IPs) are real — never whether a verdict is *correct*.
+The real capture also has no independently-confirmed ground truth (see the "Limitations"
+section of each `results/*.md` report), so today's "verification" is limited to checking that
+specific structural facts (record counts, specific IPs) are real — never whether a verdict is
+*correct*.
 
 `pydantic-evals` (2.20.0, already transitively installed via `pydantic-ai-slim[evals]`,
 matching the pinned `pydantic-ai` version) turns this into a repeatable harness: `Dataset`,

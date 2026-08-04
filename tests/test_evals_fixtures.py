@@ -58,7 +58,11 @@ class BuildSuricataFixtureTests(unittest.TestCase):
             intervals = {int((b - a).total_seconds()) for a, b in zip(starts, starts[1:])}
             self.assertEqual(intervals, {self.manifest.beacon_interval_seconds})
 
-    def test_benign_host_reaches_many_distinct_destinations_on_one_boring_port(self):
+    def test_benign_host_reuses_a_small_server_pool_over_udp(self):
+        # Regression test for the fixture bug found live on 2026-08-03 (see the comment on
+        # evals/fixtures.py's _BENIGN_* constants): every model flagged the earlier version
+        # (40 distinct never-repeated TCP destinations) as textbook C2 IP-rotation beaconing --
+        # correctly, since that's not what real NTP traffic looks like.
         with tempfile.TemporaryDirectory() as directory:
             rows = self._rows(Path(directory))
             matches = [
@@ -66,10 +70,39 @@ class BuildSuricataFixtureTests(unittest.TestCase):
                 for r in rows
                 if r["event_type"] == "flow" and r["src_ip"] == self.manifest.benign_host_src
             ]
-            self.assertEqual(len(matches), self.manifest.benign_host_dest_count)
+            self.assertEqual(len(matches), self.manifest.benign_host_connection_count)
             self.assertTrue(all(r["dest_port"] == self.manifest.benign_host_port for r in matches))
+            self.assertTrue(all(r["proto"] == "UDP" for r in matches), "real NTP is UDP, not TCP")
             distinct_dests = {r["dest_ip"] for r in matches}
             self.assertEqual(len(distinct_dests), self.manifest.benign_host_dest_count)
+            self.assertLess(
+                self.manifest.benign_host_dest_count,
+                self.manifest.benign_host_connection_count,
+                "a real client reuses a small server pool, not one connection per distinct host",
+            )
+
+    def test_benign_host_timing_and_payload_size_are_not_mechanically_uniform(self):
+        # A perfectly uniform interval/byte-count (stddev 0) was itself cited by multiple
+        # models as evidence of automation -- guard against regressing to that shape.
+        with tempfile.TemporaryDirectory() as directory:
+            rows = self._rows(Path(directory))
+            matches = sorted(
+                (
+                    r
+                    for r in rows
+                    if r["event_type"] == "flow" and r["src_ip"] == self.manifest.benign_host_src
+                ),
+                key=lambda r: r["timestamp"],
+            )
+
+            from datetime import datetime
+
+            starts = [datetime.fromisoformat(r["timestamp"]) for r in matches]
+            intervals = {int((b - a).total_seconds()) for a, b in zip(starts, starts[1:])}
+            self.assertGreater(len(intervals), 1, "intervals should vary, not be perfectly uniform")
+
+            byte_counts = {r["flow"]["bytes_toserver"] for r in matches}
+            self.assertGreater(len(byte_counts), 1, "byte counts should vary, not be identical every time")
 
     def test_stats_events_are_present_as_noise(self):
         with tempfile.TemporaryDirectory() as directory:

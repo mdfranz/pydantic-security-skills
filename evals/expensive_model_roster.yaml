@@ -1,0 +1,9 @@
+# Default model roster for the suricata-analyst eval suite (evals/dataset_suricata.py).
+# One Case is built per model listed here, in order. Override with `--roster-file <path>`
+# (same shape) or `--models a,b,c` on `uv run python -m evals.runner`. See
+# refs/pydantic-evals-plan.md.
+models:
+  - openrouter:z-ai/glm-5.2
+  - openrouter:deepseek/deepseek-v4-pro
+  - openrouter:qwen/qwen3.8-max
+  - openrouter:qwen/qwen3.7-max

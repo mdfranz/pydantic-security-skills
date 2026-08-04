@@ -6,9 +6,10 @@ in pyproject.toml, which lists only skill_runner) and a console script installed
 site-packages can't import a package that was never packaged alongside it.
 
 Complements, not replaces, `compare_models.sh`: that script drives ad hoc, human-read
-narrative comparisons against the real capture (no ground truth, see THREAT_MODEL.md); this
-runner drives repeatable, ground-truth-checked regression comparisons against the synthetic
-fixture in `evals/fixtures.py`. See refs/pydantic-evals-plan.md.
+narrative comparisons against the real capture (a synthetic/lab capture with no independently-
+confirmed ground truth -- see results/*.md's own Limitations sections); this runner drives
+repeatable, ground-truth-checked regression comparisons against the synthetic fixture in
+`evals/fixtures.py`. See refs/pydantic-evals-plan.md.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 
-from .dataset_suricata import MODEL_ROSTER, build_dataset
+from .dataset_suricata import DEFAULT_ROSTER_PATH, build_dataset
 from .fixtures import build_suricata_fixture
 from .task import run_skill_eval
 
@@ -39,7 +40,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--models",
         default=None,
-        help="Comma-separated model ids to override the default roster.",
+        help="Comma-separated model ids to override the roster file entirely.",
+    )
+    parser.add_argument(
+        "--roster-file",
+        default=str(DEFAULT_ROSTER_PATH),
+        help=f"YAML file with a 'models' list to use as the roster (default: {DEFAULT_ROSTER_PATH}). "
+        "Ignored if --models is given.",
     )
     return parser.parse_args(argv)
 
@@ -63,8 +70,11 @@ def main(argv: list[str] | None = None) -> None:
     data_source.mkdir(exist_ok=True)
     manifest = build_suricata_fixture(data_source)
 
-    models = tuple(m.strip() for m in args.models.split(",")) if args.models else MODEL_ROSTER
-    dataset = build_dataset(manifest, workspace_root, models=models)
+    if args.models:
+        models = tuple(m.strip() for m in args.models.split(","))
+        dataset = build_dataset(manifest, workspace_root, models=models)
+    else:
+        dataset = build_dataset(manifest, workspace_root, roster_path=Path(args.roster_file))
 
     report = dataset.evaluate_sync(
         run_skill_eval,

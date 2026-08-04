@@ -13,6 +13,7 @@ which covers usage; this covers *why the code is built the way it is*.
 | [`pydantic-ai-harness`](https://github.com/pydantic/pydantic-ai-harness) | 0.10.0 (pinned, held below the 0.11.0 floor that requires monty>=0.0.19) | `FileSystem` and `CodeMode` capabilities plugged into the `Agent` |
 | [`pydantic-monty`](https://github.com/pydantic/monty) | 0.0.18 (pinned; 0.0.19 has the live, unresolved multi-line-callsite crash in [`ISSUES.md`](ISSUES.md) #18) | `Monty` — the sandboxed Python interpreter that actually executes model-written code, plus `MountDir`/`OSAccess` |
 | [`logfire`](https://pydantic.dev/logfire) | 4.39.0 | Optional OpenTelemetry tracing of the whole run (`--logfire`) |
+| [`pydantic-evals`](https://ai.pydantic.dev/evals/) | 2.20.0 | Repeatable, ground-truth-checked eval harness (`evals/`) — drives the same `Agent`/`CodeMode`/`Monty` stack above through `Dataset.evaluate`, not a parallel implementation |
 | `pyyaml` | 6.0.3 | Parses `skill.yaml` (structured skill config, if present) |
 
 None of these are used in isolation — the interesting part is how `Agent`, `CodeMode`, and
@@ -374,7 +375,203 @@ the two lines above.
 
 ---
 
-## 9. Design rationale, summarized
+## 9. `pydantic-evals`: the eval harness
+
+`pydantic-evals` is a separate package from `pydantic-ai`/`pydantic-ai-harness` — it doesn't
+know anything about agents, tools, or Monty. It's a general-purpose framework for running *any*
+callable against a set of inputs, repeatedly, and scoring the outputs — closer to a test
+framework than an agent framework. The vocabulary maps onto `unittest`/`pytest` concepts loosely
+enough that it's worth walking through explicitly, since none of it existed elsewhere in this
+stack before `evals/` was added.
+
+```mermaid
+flowchart TB
+    Roster[("evals/model_roster.yaml\nmodels: [id, ...]")]
+    FixtureFn["build_suricata_fixture()\nevals/fixtures.py"]
+    Manifest[("FixtureManifest\n(ground truth: planted\nfindings, benign host, ...)")]
+    BuildDataset["build_dataset()\nevals/dataset_suricata.py"]
+
+    Roster --> BuildDataset
+    FixtureFn --> Manifest --> BuildDataset
+
+    subgraph DS["Dataset"]
+        Cases["Case × N -- one per model\ninputs=EvalCaseInputs\nmetadata=EvalCaseMetadata"]
+        Evals["evaluators=[...]  (case-level)"]
+        RepEvals["report_evaluators=[...]  (report-level)"]
+    end
+    BuildDataset --> Cases
+    BuildDataset --> Evals
+    BuildDataset --> RepEvals
+
+    subgraph Run["Dataset.evaluate(run_skill_eval, repeat=N)\none execution per case per rep"]
+        Task["run_skill_eval(inputs)\nevals/task.py"]
+        Real["prepare_run() + RunSession\n(the REAL skill_runner stack -- §1-§7)\nEvalSink -> metrics/attributes"]
+        Task -- "calls" --> Real
+        Real -- "result.output" --> Task
+    end
+    Cases --> Run
+
+    Ctx["EvaluatorContext\ninputs / metadata / output /\nduration / metrics / attributes"]
+    Run -- "per case-rep" --> Ctx
+    Evals -- "evaluate(ctx)" --> Ctx
+    Ctx -- "bool / int-float / str /\nEvaluationReason / Mapping" --> RC["ReportCase\n(assertions, scores, labels)"]
+    Run -- "task raised" --> RCF["ReportCaseFailure"]
+
+    Report[("EvaluationReport\ncases + failures")]
+    RC --> Report
+    RCF --> Report
+
+    Report -- "repeat>1: grouped by\nsource_case_name via\ncase_groups()" --> RepEvals
+    RepEvals -- "TableResult / ScalarResult" --> Analyses["report.analyses\n(Crash rate by case,\nVerdict consistency across reps)"]
+
+    Report --> Print["report.print()"]
+    Analyses --> Print
+    Report -.->|"--logfire\n(no separate\ninstrumentation call)"| Logfire["Logfire spans"]
+```
+
+### The abstractions, in the order data actually flows through them
+
+1. **`Case`** — one test scenario: `inputs` (whatever your task function needs), an optional
+   `expected_output`, and optional `metadata` (a side channel for ground truth your evaluators
+   need but that isn't part of the "real" input). A `Case` is inert data — it does nothing on
+   its own.
+   ```python
+   Case(
+       name=model,  # e.g. "openrouter:z-ai/glm-5.2" -- this becomes the report's row label
+       inputs=EvalCaseInputs(skill_dir=SKILL_DIR, prompt=PROMPT, model=model, workspace=workspace_root),
+       metadata=EvalCaseMetadata(expected_findings=..., benign_host_ip=..., malicious_keywords=...),
+   )
+   ```
+   `evals/dataset_suricata.py`'s `build_dataset()` builds one `Case` per model in the roster
+   (loaded from `evals/model_roster.yaml`, a plain `models: [id, ...]` file — see
+   `--roster-file` in `README.md` — not hardcoded, so the roster a run covers is data, not
+   code), all sharing the same prompt and the same fixture-derived `metadata`.
+
+2. **The fixture** — not a `pydantic-evals` concept at all; it's this project's own term
+   (ordinary testing jargon) for where `Case.inputs`/`Case.metadata` actually come from.
+   `pydantic-evals` doesn't know or care — it just holds whatever you put in `Case.inputs`.
+   Here, `evals/fixtures.py`'s `build_suricata_fixture()` writes a small, deterministic
+   synthetic Suricata EVE-JSON file to disk (planted findings, no RNG) and returns a
+   `FixtureManifest` — the *ground truth* for what's actually in that file. `build_dataset()`
+   turns each `FixtureManifest` field into `Case.metadata`, so evaluators read ground truth from
+   `ctx.metadata` rather than duplicating magic strings. The real 184MB capture
+   `compare_models.sh` drives (see `README.md` "Comparing models") has no such ground truth — a
+   synthetic/lab capture with no independently-confirmed answer for what's actually malicious
+   (see `results/*.md`'s own Limitations sections) — which is the entire reason `evals/` uses a
+   fixture instead of the real data: a fixture lets an `Evaluator` assert pass/fail, where the
+   real capture only ever supported "a human re-read the report and checked one number by hand."
+
+3. **`Dataset`** — a named collection of `Case`s, plus `evaluators`/`report_evaluators` that
+   apply to *every* case (individual `Case`s can also carry their own extra evaluators, unused
+   here). `Dataset` itself does nothing until you call `.evaluate(...)`.
+   ```python
+   Dataset(
+       name="suricata-model-comparison",
+       cases=cases,
+       evaluators=[SurfacesPlantedFindings(), AvoidsBenignFalsePositive(), ...],
+       report_evaluators=[CrashRateByCase(), VerdictConsistencyAcrossReps()],
+   )
+   ```
+
+4. **The task function** — an ordinary callable (sync or async), `InputsT -> OutputT`, that
+   `Dataset.evaluate(task, ...)` runs once per case (or per rep — see `repeat` below).
+   `pydantic-evals` doesn't care what it does internally, which is exactly why `evals/task.py`'s
+   `run_skill_eval` can just *be* a thin wrapper around this project's real entrypoints instead
+   of a second, evals-only reimplementation of the runner:
+   ```python
+   async def run_skill_eval(inputs: EvalCaseInputs) -> str:
+       options = RunOptions(model=inputs.model, workspace=inputs.workspace, pristine=True, ...)
+       setup = prepare_run(inputs.skill_dir, inputs.prompt, options, EvalSink())
+       with RunSession(setup, EvalSink(), checkpoint_each_turn=True) as session:
+           result = await session.submit_async(inputs.prompt, model=inputs.model_override)
+       return str(result.output)
+   ```
+   This calls the exact same `prepare_run`/`RunSession` entrypoints §1–§7 describe, the same way
+   `tests/test_run_core.py`'s `FunctionModel`-driven integration tests already do. The one
+   evals-specific hook is `model_override`, passed through to
+   `RunSession.submit_async(prompt, model=...)` — the single parameter the session already
+   exposed for substituting a `FunctionModel`/`TestModel`, so eval-harness unit tests can drive
+   the real code path with zero real API calls, the same trick the existing test suite uses.
+   Any exception the task function raises is *not* caught here — `Dataset.evaluate` catches it
+   and records a `ReportCaseFailure` instead of scoring a nonexistent output, which is how a
+   real agent crash (e.g. `ISSUES.md` #18's monty protocol error) shows up in the report at all.
+
+5. **`EvaluatorContext`** — the single object every `Evaluator` receives, built automatically
+   after the task function returns (or raises). It bundles `ctx.inputs`/`ctx.metadata` (straight
+   from the `Case`), `ctx.output` (the task function's return value), `ctx.duration`, and two
+   dicts an evaluator can read without any OTel/Logfire setup: `ctx.attributes`/`ctx.metrics`,
+   populated by calling `pydantic_evals.set_eval_attribute`/`increment_eval_metric` from
+   *inside* the task function while it runs. `evals/task.py`'s `EvalSink.emit()` calls
+   `increment_eval_metric(f"emit.{kind}", 1)` for every streamed run event (tool calls,
+   `run_code` calls, `write_file` calls), which is how `WithinToolCallBudget` reads a real
+   tool-call count without needing `--logfire` at all. (`ctx.span_tree` is the one field that
+   *does* need Logfire/OTel configured — it backs built-ins like `HasMatchingSpan`, unused here.)
+
+6. **`Evaluator`** — a `@dataclass` with one method, `evaluate(ctx) -> EvaluatorOutput`. The
+   return type is deliberately flexible, and which flavor you return changes how it renders in
+   the report:
+   - `bool` → an **assertion** (✔/✗ in the report, averaged into a pass rate across cases/reps).
+   - `int`/`float` → a **score** (averaged numerically).
+   - `str` → a **label** (tallied as a distribution, e.g. `{'high-risk': 1.0}` in the Averages
+     row — this is what `VerdictLabel` returns).
+   - `EvaluationReason(value=..., reason=...)` → any of the above plus a free-text explanation
+     shown in the report (`AvoidsBenignFalsePositive` uses this to explain *why* it failed).
+   - a `Mapping[str, ...]` of several of the above → multiple named results from one evaluator
+     call. This is how `SurfacesPlantedFindings` produces two separate assertion columns
+     (`long_lived_flow`, `beacon`) from a single class instead of needing two.
+
+   Two evaluator shapes matter in this project, both from `pydantic_evals.evaluators`:
+   - **Case-level `Evaluator`s** (`SurfacesPlantedFindings`, `AvoidsBenignFalsePositive`,
+     `WithinToolCallBudget`, `VerdictLabel`) score one case's `EvaluatorContext` in isolation —
+     same shape as the built-in `MaxDuration` used directly alongside them.
+   - **Report-level `ReportEvaluator`s** (`CrashRateByCase`, `VerdictConsistencyAcrossReps`) are
+     a different base class entirely — see step 8 below.
+
+7. **`EvaluationReport`** — what `Dataset.evaluate()` returns: a list of `ReportCase` (one per
+   case *or per rep*, each holding its own assertions/scores/labels/metrics) plus a separate
+   list of `ReportCaseFailure` for any case whose task function raised. `report.print()` renders
+   the console tables this project's live runs show (per-case rows, an Averages row, a Crash
+   rate table, a Case Failures table when applicable).
+
+8. **`repeat=N` and `ReportEvaluator`** — `Dataset.evaluate(task, repeat=N)` reruns *every* case
+   N times, naming each rerun `"<case name> [i/N]"` and tagging it with the original case name
+   as `source_case_name`. A plain `Evaluator` only ever sees one rerun at a time — it has no way
+   to compare a model against its own earlier attempt. `ReportEvaluator` is the one abstraction
+   that can: it runs once, after every case *and every rep* has finished, and receives the whole
+   `EvaluationReport` via `ReportEvaluatorContext`.
+   `EvaluationReport.case_groups()` is the method that makes this practical — it groups every
+   `ReportCase`/`ReportCaseFailure` back together by `source_case_name` (returning `None`
+   entirely when `repeat=1`, since there's nothing to group), each group carrying its own
+   `.runs`, `.failures`, and a computed `.summary` aggregate. This is what actually answers the
+   standing limitation every hand-written `results/*.md` comparison flagged ("3 reps isn't
+   enough for a reliable rate estimate"): `CrashRateByCase` walks every group and turns N
+   reruns into a real failure-rate number; `VerdictConsistencyAcrossReps` walks the same groups
+   and turns them into a self-consistency check (informational — no ground truth exists for
+   which verdict is *correct*, only whether a model agrees with itself run to run), directly
+   operationalizing the GLM-5.2 "low risk" → "HIGH confidence, isolate host" flip-flop a
+   hand-read comparison first surfaced.
+
+Two things worth knowing if you're extending this:
+- **No separate Logfire instrumentation call is needed.** `pydantic_evals`'s own `evaluate {name}`/
+  `case: {name}`/`execute {task}` spans forward through `logfire_api` automatically the moment
+  `logfire.configure()` has run anywhere in the process — the same one-time setup §8 already
+  describes covers both the agent run *and* the eval harness wrapped around it.
+- **`evals/` is dev/test-only and deliberately unshipped** — excluded from
+  `[tool.hatch.build.targets.wheel]`'s `packages` list in `pyproject.toml`, so it's always run
+  as `uv run python -m evals.runner`, never an installed `[project.scripts]` command (a
+  console-script shim installed into site-packages can't import a package that was never
+  packaged alongside it — confirmed the hard way before settling on module invocation).
+
+See [`refs/pydantic-evals-plan.md`](refs/pydantic-evals-plan.md) for the original design and
+`PROJECT.md` Phases 29–32 for what live runs against real providers actually found: a real bug
+in `AvoidsBenignFalsePositive` itself, a fixture-design bug in the planted "benign" host, and
+the `pydantic-ai-harness`/`pydantic-monty` downgrade in the stack-inventory table above — all
+three found *because* the harness made a 100%-failure pattern visible enough to investigate,
+not by manual review.
+
+---
+
+## 10. Design rationale, summarized
 
 | Decision | Why |
 | --- | --- |

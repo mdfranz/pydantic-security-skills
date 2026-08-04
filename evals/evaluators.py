@@ -45,10 +45,11 @@ class SurfacesPlantedFindings(Evaluator[EvalCaseInputs, str, EvalCaseMetadata]):
 
 @dataclass
 class AvoidsBenignFalsePositive(Evaluator[EvalCaseInputs, str, EvalCaseMetadata]):
-    """Heuristic, not authoritative (see THREAT_MODEL.md's ground-truth caveat on the real
-    184MB capture) -- but grounded in a fact that genuinely IS known here: the benign host is a
-    deliberately planted false-positive trap, not an inferred label. Flags a report that
-    mentions the planted benign host's IP in the same sentence as a malicious/urgent keyword."""
+    """Heuristic, not authoritative (the real 184MB capture has no independently-confirmed
+    ground truth -- see results/*.md's own Limitations sections) -- but grounded in a fact that
+    genuinely IS known here: the benign host is a deliberately planted false-positive trap, not
+    an inferred label. Flags a report that mentions the planted benign host's IP in the same
+    sentence as a malicious/urgent keyword."""
 
     def evaluate(self, ctx: _EvalCtx) -> EvaluatorOutput:
         metadata = ctx.metadata
@@ -108,7 +109,8 @@ class VerdictLabel(Evaluator[EvalCaseInputs, str, EvalCaseMetadata]):
     """An independent judge model classifies the report's overall verdict. Deliberately not
     one of the models under comparison, so it isn't judging its own output. Surfaced as a
     per-case **label**, not pass/fail -- there is no ground truth for which verdict is
-    correct (THREAT_MODEL.md); `VerdictConsistencyAcrossReps` is what reads this across reps."""
+    correct, only what each report claims; `VerdictConsistencyAcrossReps` is what reads this
+    across reps."""
 
     model: str = "openai:gpt-5-mini"
 
@@ -160,8 +162,8 @@ class CrashRateByCase(ReportEvaluator[EvalCaseInputs, str, EvalCaseMetadata]):
 class VerdictConsistencyAcrossReps(ReportEvaluator[EvalCaseInputs, str, EvalCaseMetadata]):
     """Informational only: whether repeated runs of the SAME model agree with their OWN
     verdict label. This is self-consistency, not correctness -- there is no ground truth for
-    which verdict is right (THREAT_MODEL.md), only whether the model is stable across
-    identical reps. Directly operationalizes the GLM-5.2 flip-flop finding in
+    which verdict is right, only whether the model is stable across identical reps. Directly
+    operationalizes the GLM-5.2 flip-flop finding in
     results/pristine-model-comparison-2026-07-19.md ("low risk" in rep 1, "HIGH confidence,
     isolate host" in reps 2 and 3 on the identical beacon)."""
 
