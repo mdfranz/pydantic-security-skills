@@ -9,11 +9,11 @@ which covers usage; this covers *why the code is built the way it is*.
 
 | Package | Version (`uv.lock`) | Role here |
 | --- | --- | --- |
-| [`pydantic-ai`](https://ai.pydantic.dev) | 2.20.0 | The `Agent` — model calling, tool-calling loop, message history |
-| [`pydantic-ai-harness`](https://github.com/pydantic/pydantic-ai-harness) | 0.10.0 (pinned, held below the 0.11.0 floor that requires monty>=0.0.19) | `FileSystem` and `CodeMode` capabilities plugged into the `Agent` |
-| [`pydantic-monty`](https://github.com/pydantic/monty) | 0.0.18 (pinned; 0.0.19 has the live, unresolved multi-line-callsite crash in [`ISSUES.md`](ISSUES.md) #18) | `Monty` — the sandboxed Python interpreter that actually executes model-written code, plus `MountDir`/`OSAccess` |
-| [`logfire`](https://pydantic.dev/logfire) | 4.39.0 | Optional OpenTelemetry tracing of the whole run (`--logfire`) |
-| [`pydantic-evals`](https://ai.pydantic.dev/evals/) | 2.20.0 | Repeatable, ground-truth-checked eval harness (`evals/`) — drives the same `Agent`/`CodeMode`/`Monty` stack above through `Dataset.evaluate`, not a parallel implementation |
+| [`pydantic-ai`](https://ai.pydantic.dev) | 2.29.0 | The `Agent` — model calling, tool-calling loop, message history |
+| [`pydantic-ai-harness`](https://github.com/pydantic/pydantic-ai-harness) | 0.18.1 | `FileSystem` and `CodeMode` capabilities plugged into the `Agent` |
+| [`pydantic-monty`](https://github.com/pydantic/monty) | 0.0.21 (includes PR #714 fix for multi-line stack frame wire validation) | `Monty` — the sandboxed Python interpreter that actually executes model-written code, plus `MountDir`/`OSAccess` |
+| [`logfire`](https://pydantic.dev/logfire) | 4.40.0 | Optional OpenTelemetry tracing of the whole run (`--logfire`) |
+| [`pydantic-evals`](https://ai.pydantic.dev/evals/) | 2.29.0 | Repeatable, ground-truth-checked eval harness (`evals/`) — drives the same `Agent`/`CodeMode`/`Monty` stack above through `Dataset.evaluate`, not a parallel implementation |
 | `pyyaml` | 6.0.3 | Parses `skill.yaml` (structured skill config, if present) |
 
 None of these are used in isolation — the interesting part is how `Agent`, `CodeMode`, and

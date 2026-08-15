@@ -8,9 +8,9 @@ dependencies = [
     "logfire[system-metrics]>=4.37.0",
     "polars>=1.0.0",
     "pydantic-ai>=2.9.1",
-    "pydantic-ai-harness[codemode]==0.10.0",
+    "pydantic-ai-harness[codemode]>=0.7.0",
     "pydantic-evals>=2.20.0",
-    "pydantic-monty==0.0.18",
+    "pydantic-monty>=0.0.18",
     "pyyaml>=6.0.3",
 ]
 
@@ -23,6 +23,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["skill_runner"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
 
 [project.optional-dependencies]
 tui = [

@@ -1181,3 +1181,20 @@ would actually conclude from the data, closing the loop from "harness surfaces a
 the same session — the harness's report_evaluators and per-assertion breakdown were what made
 the pattern visible enough to investigate in the first place.
 
+### Phase 33: Unpin & Upgrade Pydantic AI Ecosystem Dependencies (2026-08-15)
+
+**Objective:** Upgrade all dependencies now that upstream `pydantic-monty` PR #714 has resolved the multi-line stack frame wire validation issue (`ISSUES.md` #18).
+
+**Changes:**
+- Unpinned `pydantic-monty` and `pydantic-ai-harness` in `pyproject.toml`.
+- Upgraded packages via `uv lock --upgrade`:
+  - `pydantic-monty` from `0.0.18` to `0.0.21` (including client & runtime binaries).
+  - `pydantic-ai-harness` from `0.10.0` / `0.13.0` to `0.18.1`.
+  - `pydantic-ai` / `pydantic-ai-slim` / `pydantic-evals` / `pydantic-graph` from `2.20.0` to `2.29.0`.
+  - `logfire` / `logfire-api` from `4.39.0` to `4.40.0`.
+  - `polars` from `1.43.1` to `1.43.2`.
+- Synchronized virtual environment via `uv sync`.
+- Added `pytest` dev dependency to `pyproject.toml`.
+- Ran full test suite (`uv run pytest`): 120/120 tests passed.
+
+
