@@ -48,6 +48,18 @@ Both models used the **same skill** (`skills/suricata-analyst`) with **identical
 
 **Workspace mode:** All runs used `--pristine` (isolated, fresh task workspace per run), preventing script reuse across models and eliminating confounds from artifact carryover.
 
+### About `--pristine` Mode
+
+In `skill-runner`, workspaces are **accumulative by default**—generated scripts, reports, and analysis artifacts persist across runs, allowing later invocations to discover and reuse them. This is useful for iterative investigation but confounds model comparisons.
+
+`--pristine` creates a fresh, isolated task workspace with:
+- Empty directory (no prior scripts)
+- No artifact discovery from previous runs
+- Independent execution path for each model
+- No reuse advantage from earlier work
+
+In this evaluation, every run started from a blank slate, so both models had to generate their own queries and code. This is why 3.7-flash *creates* `suricata_event_summary.py` in every run—there's nothing to reuse, but it invests in a reusable baseline anyway (a forward-looking strategy for non-pristine usage).
+
 ### Pydantic Monty Integration
 
 Code execution runs through **`pydantic-monty` 0.0.21**, a sandbox that:
@@ -141,6 +153,118 @@ Both models produced identical results across all 3 runs:
 - Script persistence: Always creates `suricata_event_summary.py` (3/3 runs)
 - Consistency: Deliberate script creation every single run
 - Strategy: Invests in reusable baseline despite pristine mode
+
+### Code & SQL Generation Examples
+
+**3.6-flash: Direct Aggregation Approach**
+
+First `run_code` call:
+```python
+schema = describe_events(name="eve-2026-01-21-01.json")
+event_counts = aggregate_events(name="eve-2026-01-21-01.json", group_by=["event_type"])
+
+{
+    "schema_sample": schema["columns"][:10],
+    "total_columns": len(schema["columns"]),
+    "event_type_counts": event_counts
+}
+```
+
+Characteristic of 3.6-flash: **No intermediate variables, minimal comments, inline dictionary construction.** Combines multiple operations in one call. Efficient but less reusable.
+
+Second `run_code` call:
+```python
+filename = "eve-2026-01-21-01.json"
+total = aggregate_events(name=filename)
+total
+```
+
+Follows the same pattern—minimal setup, direct computation, returns raw result.
+
+---
+
+**3.7-flash: Script-Creation Approach**
+
+First `run_code` call (inline computation):
+```python
+log_name = "eve-2026-01-21-01.json"
+event_counts = aggregate_events(name=log_name, group_by=["event_type"])
+total = aggregate_events(name=log_name)
+
+result = {
+    "total_events": total.get("count", 0),
+    "event_types": event_counts.get("groups", []),
+    "truncated": event_counts.get("truncated", False)
+}
+result
+```
+
+Then `write_file` call to create reusable script:
+```python
+# suricata_event_summary.py
+filename = "eve-2026-01-21-01.json"
+
+totals = aggregate_events(name=filename)
+event_breakdown = aggregate_events(name=filename, group_by=["event_type"])
+
+summary = {
+    "total_events": totals.get("count", 0),
+    "event_types": event_breakdown.get("groups", []),
+    "truncated": event_breakdown.get("truncated", False),
+}
+
+summary
+```
+
+Characteristic of 3.7-flash: **Extracted logic into a named script, added comments, uses `.get()` defensively, exposes variables for reuse.** Slower initially but leaves behind a tool for future runs.
+
+---
+
+**Risk Assessment: SQL Generation Differences**
+
+When investigating the Tailscale egress anomaly, models diverged sharply.
+
+**3.6-flash SQL query (investigating egress hosts):**
+```sql
+SELECT src_ip, dest_ip, alert.signature AS signature, alert.severity AS severity, count(*) AS count
+FROM events
+WHERE event_type = 'alert'
+GROUP BY 1, 2, 3, 4
+ORDER BY severity ASC, count DESC
+```
+
+Very targeted—looks for alerts grouped by source/destination and severity. When zero alerts are found, the model pivots to flow-level analysis.
+
+**3.7-flash SQL query (investigating same scenario, but holistic):**
+```sql
+WITH u AS (
+    SELECT unnest(dns.queries) AS q
+    FROM events
+    WHERE event_type = 'dns' AND dns.queries IS NOT NULL
+)
+SELECT q.rrtype AS rrtype, count(*) as cnt
+FROM u
+GROUP BY q.rrtype
+ORDER BY cnt DESC
+```
+
+Uses unnesting and CTEs (Common Table Expressions) to decompose nested JSON structures. More exploratory, aimed at understanding DNS patterns rather than hunting for alerts.
+
+**Impact:** 3.6-flash's alert-first approach finds nothing, then pivots. 3.7-flash explores the data structure proactively, discovering legitimate SaaS traffic patterns. Different SQL philosophies → different risk conclusions.
+
+---
+
+### Why Code Generation Patterns Matter
+
+| Aspect | 3.6-flash | 3.7-flash |
+|--------|-----------|-----------|
+| **Script reusability** | No—inline, single-use | Yes—extracted, named, defensive |
+| **Intermediate state** | Minimal—direct returns | Explicit—named variables, `.get()` guards |
+| **Query style** | Alert-first, pivots on empty | Exploratory, pattern-seeking |
+| **Time investment** | Fast first run, no setup | Slower first run, future-proof |
+| **Debugging** | Harder—inlined logic | Easier—variables in script |
+
+In `--pristine` mode, 3.7-flash's script creation has no runtime benefit (nothing to reuse), but reveals a **forward-looking mindset**. In accumulative mode (default), those scripts become assets for future runs.
 
 ---
 
