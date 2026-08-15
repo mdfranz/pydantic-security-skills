@@ -19,6 +19,69 @@ Both models are correct on factual tasks. Key differences:
 
 ---
 
+## Environment & Technical Context
+
+### Pydantic AI & Harness
+
+Tests ran via **`pydantic-ai` 2.29.0** with **`pydantic-ai-harness` 0.18.1**, a framework for evaluating LLM agents on structured tasks. The harness provides:
+
+- **Tool orchestration** — agents invoke tools (`run_code`, `aggregate_events`, `query_sql`, `write_file`, etc.) within a sandbox
+- **Sandbox execution** — Python code runs in isolated environments with dataset query access
+- **Telemetry collection** — Logfire MCP instrumentation captures all tool invocations, latency, token usage
+- **Artifact persistence** — generated scripts/reports are saved in per-task workspaces (unless `--pristine` is used)
+
+Both models used the **same skill** (`skills/suricata-analyst`) with **identical tool access**. The differences in behavior reflect model-level choices about *how* to use those tools, not capability differences.
+
+### Data & Workspace
+
+**Input dataset:** `eve-2026-01-21-01.json`
+- Size: 240 MB
+- Format: Suricata EVE (Extensible Value Event) JSON logs
+- Events: 428,126 records spanning 24 hours (2026-01-21 00:00–23:59 UTC)
+- Content: Flow telemetry, TLS/QUIC handshakes, DNS queries, DHCP, operational stats — **zero signature alerts**
+
+**Query access:** Models queried the dataset via:
+- `describe_events()` — schema introspection
+- `aggregate_events()` — group-by aggregation (event type, source IP, protocol, etc.)
+- `query_sql()` — arbitrary SQL via DataFusion on Parquet-backed data
+- `run_code()` — arbitrary Python in a sandbox with access to above functions
+
+**Workspace mode:** All runs used `--pristine` (isolated, fresh task workspace per run), preventing script reuse across models and eliminating confounds from artifact carryover.
+
+### Pydantic Monty Integration
+
+Code execution runs through **`pydantic-monty` 0.0.21**, a sandbox that:
+- Parses and validates Python syntax before execution
+- Enforces resource limits (timeout, output size)
+- Provides multi-line stack frame context on errors (crucial for iterative debugging)
+- Tracks tool invocations and return values for telemetry
+
+Monty handles the Python runtime; Pydantic AI handles the agentic loop (LLM → tool selection → tool execution → next turn).
+
+### Logfire Observability
+
+Logfire traces all invocations at:
+- **Span level**: `chat`, `execute_tool`, `run_code`, `query_sql`, etc.
+- **Metrics captured**: Duration, tool-call counts, token usage, latency percentiles
+- **Telemetry granularity**: Per-invocation timing allows latency distribution analysis (P50, avg, P95) beyond simple wall-clock totals
+
+Logfire MCP queries extracted trace data post-run for efficiency analysis.
+
+### Model Configuration
+
+Both models accessed the Google Gemini API directly via `google:` provider configuration in `models.yaml`:
+
+```yaml
+google:
+  models:
+    - id: "google:gemini-3.6-flash"
+    - id: "google:gemini-3.7-flash"
+```
+
+No OpenRouter proxy, no model-specific system prompts, no prompt engineering per model. The skill's own system prompt and tool definitions apply uniformly.
+
+---
+
 ## Test Parameters
 
 All tests ran against the same EVE JSON file in isolated pristine workspaces with Logfire instrumentation.
