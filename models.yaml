@@ -6,10 +6,18 @@ providers:
       - id: "google:gemini-3-flash-preview"
         alias: "gemini-3-flash"
         description: "Gemini 3 Flash Preview"
-      
+
       - id: "google:gemini-3.5-flash"
         alias: "gemini-3.5-flash"
         description: "Gemini 3.5 Flash"
+
+      - id: "google:gemini-3.6-flash"
+        alias: "gemini-3.6-flash"
+        description: "Gemini 3.6 Flash"
+
+      - id: "google:gemini-3.7-flash"
+        alias: "gemini-3.7-flash"
+        description: "Gemini 3.7 Flash"
 
   openai:
     description: "OpenAI Models"
