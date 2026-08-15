@@ -81,9 +81,11 @@ plt.savefig(results_dir / 'gemini-speed-consistency.png', dpi=150, bbox_inches='
 plt.close()
 
 # Chart 3: Query Efficiency
+# Source: Logfire, per-trace-id tool-span aggregation joined to model label (avoids the
+# chat-turn x tool-call fan-out bug from a naive trace_id join). All 9 documented runs.
 fig, ax = plt.subplots(figsize=(10, 6))
 models = ['3.6-flash', '3.7-flash']
-queries_per_call = [1.74, 2.83]
+queries_per_call = [20 / 30, 28 / 23]  # 3.6-flash: 20 query_sql / 30 run_code; 3.7-flash: 28/23
 
 bars = ax.barh(models, queries_per_call, color=[colors['3.6-flash'], colors['3.7-flash']], alpha=0.8, height=0.5)
 
@@ -93,11 +95,12 @@ ax.grid(axis='x', alpha=0.3)
 
 # Add value labels
 for i, (bar, val) in enumerate(zip(bars, queries_per_call)):
-    ax.text(val + 0.05, bar.get_y() + bar.get_height()/2.,
+    ax.text(val + 0.03, bar.get_y() + bar.get_height()/2.,
             f'{val:.2f}', ha='left', va='center', fontsize=11, fontweight='bold')
 
 # Add annotation for efficiency gain
-ax.text(2.3, 0.5, '62% better\nbatching', ha='center', fontsize=9,
+pct_gain = (queries_per_call[1] / queries_per_call[0] - 1) * 100
+ax.text(1.0, 0.5, f'{pct_gain:.0f}% better\nbatching', ha='center', fontsize=9,
         bbox=dict(boxstyle='round,pad=0.5', facecolor='yellow', alpha=0.3))
 
 plt.tight_layout()
@@ -139,12 +142,14 @@ plt.savefig(results_dir / 'gemini-chat-latency.png', dpi=150, bbox_inches='tight
 plt.close()
 
 # Chart 5: Tool Call Distribution
+# Source: Logfire, per-trace-id tool-span counts (75 total calls each model, across the
+# 9 documented runs -- corrected from an earlier fan-out join bug that inflated these ~13x).
 fig, ax = plt.subplots(figsize=(12, 6))
 models = ['3.6-flash', '3.7-flash']
-query_sql = [1000, 1288]
-run_code = [576, 455]
-aggregate = [51, 141]
-other = [98, 136]
+query_sql = [20, 28]
+run_code = [30, 23]
+aggregate = [9, 11]
+other = [16, 13]  # describe_events + list_directory + find_files + write_file + read_tool_result + query_events
 
 x = np.arange(len(models))
 width = 0.6
@@ -171,10 +176,13 @@ plt.savefig(results_dir / 'gemini-tool-distribution.png', dpi=150, bbox_inches='
 plt.close()
 
 # Chart 6: Risk Assessment Findings
+# Source: findings from manual transcript review; SQL query counts from Logfire span counts
+# for the two risk-assessment traces specifically (corrected from log-text regex, which
+# double/triple-counted each query_sql call across its live-stream + end-of-run recap prints).
 fig, ax = plt.subplots(figsize=(10, 6))
 models = ['3.6-flash', '3.7-flash']
 findings = [4, 3]
-sql_queries = [64, 97]
+sql_queries = [20, 28]
 
 x = np.arange(len(models))
 width = 0.35
@@ -212,10 +220,35 @@ plt.tight_layout()
 plt.savefig(results_dir / 'gemini-risk-assessment.png', dpi=150, bbox_inches='tight')
 plt.close()
 
-print("✅ Generated 6 charts:")
+# Chart 7: Risk Assessment Wall-Clock Duration
+# Source: Logfire invoke_agent trace start/end timestamps for the two risk-assessment traces.
+fig, ax = plt.subplots(figsize=(10, 6))
+models = ['3.6-flash', '3.7-flash']
+wall_clock = [109, 62]
+
+bars = ax.barh(models, wall_clock, color=[colors['3.6-flash'], colors['3.7-flash']], alpha=0.8, height=0.5)
+
+ax.set_xlabel('Wall-Clock Duration (seconds)', fontsize=11, fontweight='bold')
+ax.set_title('Risk Assessment: Total Run Duration (Lower = Better)', fontsize=13, fontweight='bold', pad=20)
+ax.grid(axis='x', alpha=0.3)
+
+for bar, val in zip(bars, wall_clock):
+    ax.text(val + 2, bar.get_y() + bar.get_height()/2.,
+            f'{val}s', ha='left', va='center', fontsize=11, fontweight='bold')
+
+pct_faster = (wall_clock[0] - wall_clock[1]) / wall_clock[0] * 100
+ax.text(85, 0.5, f'3.7-flash {pct_faster:.0f}%\nfaster overall', ha='center', fontsize=9,
+        bbox=dict(boxstyle='round,pad=0.5', facecolor='yellow', alpha=0.3))
+
+plt.tight_layout()
+plt.savefig(results_dir / 'gemini-risk-walltime.png', dpi=150, bbox_inches='tight')
+plt.close()
+
+print("✅ Generated 7 charts:")
 print("  - gemini-speed-performance.png")
 print("  - gemini-speed-consistency.png")
 print("  - gemini-query-efficiency.png")
 print("  - gemini-chat-latency.png")
 print("  - gemini-tool-distribution.png")
 print("  - gemini-risk-assessment.png")
+print("  - gemini-risk-walltime.png")

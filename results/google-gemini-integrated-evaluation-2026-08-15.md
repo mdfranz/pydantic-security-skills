@@ -12,10 +12,13 @@ Both models are correct on factual tasks. Key differences:
 
 - **Speed:** 3.6-flash is **2.4× faster** on simple queries (6.3s vs 15.4s avg)
 - **Depth:** 3.6-flash found **4 concerns** vs 3.7-flash's **3 concerns** (detected additional Tailscale egress risk)
-- **Efficiency:** 3.7-flash is **16% faster on chat latency** and achieves **62% better query batching**
+- **Efficiency:** 3.7-flash is **16% faster on chat latency** and batches SQL **82% more aggressively** per `run_code` call
+- **Risk-assessment wall-clock:** on the complex, ambiguous task, 3.7-flash finished in **62s vs 3.6-flash's 109s — 43% faster overall**, despite running more SQL queries
 - **Philosophy:** 3.6-flash is security-first; 3.7-flash is operationally pragmatic
 
 **Bottom line:** Choose 3.6-flash for speed and aggressive threat hunting; 3.7-flash for efficiency and contextual judgment.
+
+*All performance figures below are sourced from Logfire span data via MCP query, using a per-trace-id aggregation that avoids a fan-out join bug present in an earlier draft of this report (see "Telemetry Analysis" for detail).*
 
 ---
 
@@ -77,7 +80,10 @@ Logfire traces all invocations at:
 - **Metrics captured**: Duration, tool-call counts, token usage, latency percentiles
 - **Telemetry granularity**: Per-invocation timing allows latency distribution analysis (P50, avg, P95) beyond simple wall-clock totals
 
-Logfire MCP queries extracted trace data post-run for efficiency analysis.
+Logfire MCP queries extracted trace data post-run for efficiency analysis. Two methodology notes, both corrected in this version of the report:
+
+1. **Fan-out join bug (Telemetry Analysis section).** An initial Logfire query joined chat spans to tool spans on `trace_id` directly. Since a single run's trace contains many chat turns *and* many tool calls, that join produced one row per (chat-turn × tool-call) pair — inflating every tool-call count by roughly 13×. The fix: aggregate tool spans per `trace_id` first, then join to a one-row-per-trace model label.
+2. **Unrelated trace in the time window.** The corrected queries surfaced a 10th trace (3.7-flash, 17 chat turns, 42 tool calls, 47s, starting 2026-08-15T11:22:59Z) that predates this evaluation's first documented run by several minutes and doesn't match any of the nine skill-runner invocations described in this report. It's excluded from all figures here (filtered by `start_timestamp >= '2026-08-15T11:24:00Z'`).
 
 ### Model Configuration
 
@@ -222,9 +228,9 @@ Characteristic of 3.7-flash: **Extracted logic into a named script, added commen
 
 **Risk Assessment: SQL Generation Differences**
 
-When investigating the Tailscale egress anomaly, models diverged sharply.
+When investigating the traffic, the two models opened and explored differently. (Correction: an earlier version of this section swapped the two examples below between models — verified against the raw run transcripts, `/tmp/gemini-3.6-flash-risk.log` and `/tmp/gemini-3.7-flash-risk.log`.)
 
-**3.6-flash SQL query (investigating egress hosts):**
+**3.7-flash SQL query (its opening move — alert-first):**
 ```sql
 SELECT src_ip, dest_ip, alert.signature AS signature, alert.severity AS severity, count(*) AS count
 FROM events
@@ -233,9 +239,9 @@ GROUP BY 1, 2, 3, 4
 ORDER BY severity ASC, count DESC
 ```
 
-Very targeted—looks for alerts grouped by source/destination and severity. When zero alerts are found, the model pivots to flow-level analysis.
+The very first query of the run — targeted, checking for signature alerts grouped by source/destination and severity before doing anything else. When zero alerts come back, the model broadens into flow- and protocol-level analysis.
 
-**3.7-flash SQL query (investigating same scenario, but holistic):**
+**3.6-flash SQL query (mid-investigation — DNS record-type breakdown):**
 ```sql
 WITH u AS (
     SELECT unnest(dns.queries) AS q
@@ -248,9 +254,9 @@ GROUP BY q.rrtype
 ORDER BY cnt DESC
 ```
 
-Uses unnesting and CTEs (Common Table Expressions) to decompose nested JSON structures. More exploratory, aimed at understanding DNS patterns rather than hunting for alerts.
+Uses unnesting and a CTE (Common Table Expression) to decompose the nested `dns.queries` array — run partway through 3.6-flash's 22-call investigation, after it had already covered event types, flow volumes, and host-level anomalies, to characterize DNS query patterns.
 
-**Impact:** 3.6-flash's alert-first approach finds nothing, then pivots. 3.7-flash explores the data structure proactively, discovering legitimate SaaS traffic patterns. Different SQL philosophies → different risk conclusions.
+**Impact:** 3.7-flash rules out the "known bad" signature-alert path *first*, then generalizes. 3.6-flash never queries `event_type = 'alert'` directly — it starts broad (schema, event counts, flow/host analysis) and only reaches DNS structure well into the run. Both eventually cover similar ground. The differing risk ratings don't trace to *which query ran first* — they trace to how each model weighted the Tailscale egress volume once found (see "Analysis Excerpts" below).
 
 ---
 
@@ -260,7 +266,7 @@ Uses unnesting and CTEs (Common Table Expressions) to decompose nested JSON stru
 |--------|-----------|-----------|
 | **Script reusability** | No—inline, single-use | Yes—extracted, named, defensive |
 | **Intermediate state** | Minimal—direct returns | Explicit—named variables, `.get()` guards |
-| **Query style** | Alert-first, pivots on empty | Exploratory, pattern-seeking |
+| **Query style (risk assessment)** | Starts broad (schema/flow/host), reaches DNS structure mid-run | Alert-first — checks `event_type = 'alert'` before anything else |
 | **Time investment** | Fast first run, no setup | Slower first run, future-proof |
 | **Debugging** | Harder—inlined logic | Easier—variables in script |
 
@@ -276,10 +282,10 @@ This open-ended prompt exposes interpretation differences. Both correctly identi
 
 ### Risk Ratings
 
-| Model | Rating | Findings | Tool Calls | SQL Queries |
-|-------|--------|----------|-----------|------------|
-| **3.6-flash** | MODERATE-TO-HIGH | 4 concerns | 22 | 64 |
-| **3.7-flash** | LOW-TO-MODERATE | 3 concerns | 19 | 97 |
+| Model | Rating | Findings | run_code Calls | SQL Queries | Wall-Clock |
+|-------|--------|----------|-----------|------------|-----------|
+| **3.6-flash** | MODERATE-TO-HIGH | 4 concerns | 22 | 20 | 109s |
+| **3.7-flash** | LOW-TO-MODERATE | 3 concerns | 19 | 28 | 62s |
 
 ### Findings: Identified by Both ✓
 
@@ -325,7 +331,7 @@ This open-ended prompt exposes interpretation differences. Both correctly identi
 **3.7-flash: Operational Context**
 - Stance: Validates legitimate traffic patterns; contextualizes anomalies as misconfiguration
 - Tone: Conservative; notes all TLS SNIs are standard enterprise SaaS
-- Approach: Efficient query batching (19 run_code with 97 SQL queries, 62% more per-call)
+- Approach: Efficient query batching (19 run_code calls carrying 28 SQL queries, ~62% more per-call than 3.6-flash's 20/22) — and finished the whole run in 62s vs 3.6-flash's 109s
 - Useful for: Operational teams, alert fatigue reduction, pragmatic assessment
 
 ### Analysis Excerpts: Actual Model Output
@@ -348,6 +354,8 @@ This is the aggressive, threat-hunt interpretation. The model saw large data vol
 > While Suricata generated **0 signature-based threat alerts**, in-depth protocol analysis across the **427,707 total events** revealed significant anomalous traffic, misconfigured agent beaconing, high-volume outbound data transfers over mesh VPN infrastructure, inter-VLAN data movement, and excessive network noise.
 
 Security-first framing: "anomalous," "beaconing," "exfiltration," "network noise."
+
+> **Note:** 3.6-flash's own total of "427,707" doesn't match the verified 428,126 established in the Simple Query section — a gap of exactly 419, which equals the dhcp event count. This is quoted verbatim as the model wrote it; it looks like an arithmetic slip in the model's own output (possibly excluding dhcp from its running total without saying so), not a transcription error in this report.
 
 **3.7-flash on Risk Conclusion:**
 > **Overall Risk Assessment**: **Low to Moderate Risk**
@@ -377,45 +385,52 @@ Operational-first framing: "No intrusions," "standard environment," lists specif
 
 ![Query Efficiency Chart](gemini-query-efficiency.png)
 
+> **Correction:** an earlier version of this section reported 576/1,000 and 455/1,288 for `run_code`/`query_sql` calls. Those figures came from a Logfire SQL query that joined chat spans to tool spans on `trace_id` without first aggregating each side — since a single run has *many* chat turns and *many* tool calls sharing one `trace_id`, that join produced one row per (chat-turn × tool-call) pair rather than one row per tool call, inflating every count by roughly 13×. The numbers below are corrected by aggregating tool spans per `trace_id` first, then joining to a one-row-per-trace model label.
+
 | Model | run_code Calls | SQL Queries | Queries/Call | Avg Query |
 |-------|---------------|------------|--------------|-----------|
-| **3.6-flash** | 576 | 1,000 | 1.74 | 48.3ms |
-| **3.7-flash** | 455 | 1,288 | **2.83** | **36.8ms** |
+| **3.6-flash** | 30 | 20 | 0.67 | 48.3ms |
+| **3.7-flash** | 23 | 28 | **1.22** | **36.8ms** |
 
-**Key insight:** 3.7-flash batches queries **62% more aggressively**, running **28.8% more SQL** across **21% fewer calls** with **24% faster average query latency**.
+**Key insight:** 3.7-flash batches queries **82% more aggressively** per `run_code` call, running **40% more SQL** (28 vs 20) across **23% fewer `run_code` calls**, with **24% faster average query latency**. (The average-latency figures were unaffected by the join bug — averages are invariant to uniform row duplication — only the counts and sums needed correcting.)
 
 ### Tool Call Distribution (All Runs)
 
 ![Tool Distribution Chart](gemini-tool-distribution.png)
 
-**3.6-flash:**
-- query_sql: 1,000 calls (32% of time)
-- run_code: 576 calls (44% of time)
-- aggregate_events: 51 calls (2%)
-- other: 98 calls (2%)
-- **Total execution:** ~75.9 seconds | **Call throughput:** 22.7 calls/sec
+**3.6-flash** — 75 tool calls total, 2.99s combined tool-execution time:
+- run_code: 30 calls (avg 55.6ms)
+- query_sql: 20 calls (avg 48.3ms)
+- aggregate_events: 9 calls (avg 19.4ms)
+- describe_events: 8 calls (avg 8.5ms)
+- list_directory, find_files, write_file, read_tool_result, query_events: 1–4 calls each
 
-**3.7-flash:**
-- query_sql: 1,288 calls (29% of time)
-- run_code: 455 calls (42% of time)
-- aggregate_events: 141 calls (4%)
-- write_file: 59 calls (1%)
-- **Total execution:** ~81.2 seconds | **Call throughput:** 21.2 calls/sec
+**3.7-flash** — 75 tool calls total, 3.27s combined tool-execution time:
+- query_sql: 28 calls (avg 36.8ms)
+- run_code: 23 calls (avg 76.9ms)
+- aggregate_events: 11 calls (avg 29.8ms)
+- write_file: 5 calls (avg 1.2ms)
+- list_directory, describe_events, query_events: 1–4 calls each
+
+**Both models made exactly 75 tool calls** across their respective runs — a dead tie on raw volume. The real story isn't call count; it's that **tool execution is nearly free** (under 3.3 seconds combined, for either model, across all 75 calls) next to LLM response latency (140.7s / 111.0s total — see Chat Response Latency above). Essentially all wall-clock time in these runs is the model thinking, not the sandbox or DuckDB executing.
 
 ### Risk Assessment Deep Dive (Subset)
 
 ![Risk Assessment Chart](gemini-risk-assessment.png)
 
-Looking specifically at the complex risk assessment runs:
+Looking specifically at the two risk-assessment traces, using Logfire span counts rather than text-parsed log counts. (The SQL-query figures in an earlier version of this table — 64 and 97 — came from a regex count of the substring `query_sql` across the raw console log text. skill-runner prints each `run_code` block's code twice: once streamed live during execution, once again in an end-of-run `[call ...] ... [return ...]` recap. A plain substring count over the whole log therefore counts each embedded `query_sql(...)` roughly 3× — matching the observed 3.2–3.5× gap between the old and corrected figures below. The `run_code` counts were unaffected, since they used a different, non-duplicated log marker.)
 
 | Metric | 3.6-flash | 3.7-flash |
 |--------|-----------|-----------|
 | run_code invocations | 22 | 19 |
-| SQL queries embedded | 64 | 97 |
-| Queries per run_code | 2.9 | **5.1** |
-| Total time | ~40s | ~42s |
+| SQL queries embedded | 20 | **28** |
+| Queries per run_code | 0.91 | **1.47** |
+| Chat turns | 25 | 23 |
+| **Wall-clock duration** | **109s** | **62s** |
 
-**Finding:** 3.7-flash ran **50% more queries** in **3 fewer run_code calls**, achieving higher query consolidation despite similar wall-clock time.
+**Finding:** 3.7-flash completed the same open-ended risk assessment in **62 seconds — 43% faster than 3.6-flash's 109 seconds** — while running 40% more SQL queries (28 vs 20) across fewer chat turns (23 vs 25) and fewer `run_code` calls (19 vs 22). This is the clearest evidence in the evaluation that 3.7-flash's query-batching habit converts into real wall-clock savings, not just a per-call statistic — even on the run where 3.6-flash surfaced one additional finding (Tailscale egress) that 3.7-flash didn't flag as a risk.
+
+![Risk Assessment Wall-Clock Chart](gemini-risk-walltime.png)
 
 ### How They Investigated the Same Anomalies: Tone & Framing
 
@@ -473,17 +488,18 @@ Assumes legitimacy first; asks for verification rather than raising suspicion.
 | Speed consistency | 27% variance | 33% variance | **3.6-flash** |
 | Complex analysis depth | 4 concerns | 3 concerns | **3.6-flash** |
 | Chat latency (Logfire) | 3.70s | 3.08s | **3.7-flash (16%)** |
-| Query efficiency | 1.74/call | 2.83/call | **3.7-flash (62%)** |
+| Query efficiency (all runs) | 0.67/call | 1.22/call | **3.7-flash (82%)** |
+| Risk-assessment wall-clock | 109s | 62s | **3.7-flash (43%)** |
 | Script persistence | Never | Always | **3.7-flash** |
 | Risk assessment approach | Paranoid | Pragmatic | Org-dependent |
 
 ### Key Takeaway
 
-**3.6-flash excels at speed and security paranoia.** Best for rapid triage and threat hunting where detection sensitivity is critical and false positive rate is acceptable.
+**3.6-flash excels at speed on simple, deterministic tasks and security paranoia on open-ended ones.** Best for rapid triage and threat hunting where detection sensitivity is critical and false positive rate is acceptable — but note it took **76% longer** (109s vs 62s) to produce its more paranoid risk assessment.
 
-**3.7-flash delivers better infrastructure efficiency, faster per-turn latency, and operational pragmatism.** Best for sustained analysis where context matters and alert fatigue is a real cost.
+**3.7-flash delivers better infrastructure efficiency, faster per-turn latency, and operational pragmatism — and that efficiency compounds into real wall-clock savings on complex tasks**, not just simple ones. Best for sustained analysis where context matters, alert fatigue is a real cost, and turnaround time on open-ended investigation matters.
 
-Both are factually correct. Choose based on your investigation priorities: speed + security sensitivity (3.6-flash) or efficiency + contextual judgment (3.7-flash).
+Both are factually correct. Choose based on your investigation priorities: speed + security sensitivity on simple tasks (3.6-flash) or efficiency + contextual judgment + faster complex-task turnaround (3.7-flash).
 
 ---
 
@@ -491,4 +507,4 @@ Both are factually correct. Choose based on your investigation priorities: speed
 
 - `google-gemini-3runs-comparison-2026-08-15.md` — Speed/correctness 3-rep detailed breakdown
 - `google-gemini-risk-assessment-comparison-2026-08-15.md` — Risk assessment qualitative analysis
-- `google-gemini-logfire-telemetry-analysis-2026-08-15.md` — Detailed Logfire telemetry metrics
+- `google-gemini-logfire-telemetry-analysis-2026-08-15.md` — Detailed Logfire telemetry metrics — **note:** this standalone report predates the corrections above and still contains the inflated tool-call counts (the fan-out join bug described in "Logfire Observability"). Treat the numbers in *this* integrated report as authoritative; the standalone telemetry report is kept for history but is superseded on every figure it shares with this one.
