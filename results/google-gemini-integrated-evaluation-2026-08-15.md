@@ -137,6 +137,36 @@ This open-ended prompt exposes interpretation differences. Both correctly identi
 - Approach: Efficient query batching (19 run_code with 97 SQL queries, 62% more per-call)
 - Useful for: Operational teams, alert fatigue reduction, pragmatic assessment
 
+### Analysis Excerpts: Actual Model Output
+
+**3.6-flash on Tailscale Egress:**
+> Over **660 MB** of data was uploaded directly to Tailscale logging and control plane nodes over TLS (443/TCP). In addition, 192.168.2.197 probed dozens of global STUN/DERP servers (port 3478/UDP).
+>
+> **Risk:** Unmonitored overlay networks (Tailscale) can be abused for covert data exfiltration or to bypass perimeter firewall policies.
+
+This is the aggressive, threat-hunt interpretation. The model saw large data volumes on an unmonitored channel and flagged it as a potential exfiltration vector.
+
+**3.7-flash on Same Tailscale Egress:**
+> The dataset captures 428,126 events spanning exactly 24 hours. The traffic profile reflects a standard dual-use developer/enterprise and homelab environment with active Kubernetes/Rancher clusters (longhorn-upgrade-responder.rancher.io), observability agents (e1.zinclabs.dev, apt.vector.dev), heavy Tailscale mesh VPN networking (*.tail4ee2.ts.net), and typical client device activity (Apple iCloud, Microsoft Office 365, Adobe Creative Cloud, WhatsApp, Canva).
+
+3.7-flash contextualized the entire dataset as "dual-use developer/homelab," which immediately frames Tailscale logging as expected background activity rather than a threat signal.
+
+**3.6-flash on Risk Conclusion:**
+> **Overall Risk Posture:** **MODERATE-TO-HIGH OPERATIONAL & SECURITY RISK**
+>
+> While Suricata generated **0 signature-based threat alerts**, in-depth protocol analysis across the **427,707 total events** revealed significant anomalous traffic, misconfigured agent beaconing, high-volume outbound data transfers over mesh VPN infrastructure, inter-VLAN data movement, and excessive network noise.
+
+Security-first framing: "anomalous," "beaconing," "exfiltration," "network noise."
+
+**3.7-flash on Risk Conclusion:**
+> **Overall Risk Assessment**: **Low to Moderate Risk**
+>
+> **Active Intrusion / Threat Detections**: **None** (0 signature alerts, no malicious C2 or exploit activity observed)
+>
+> The dataset captures 428,126 events spanning exactly 24 hours... The traffic profile reflects a standard dual-use developer/enterprise and homelab environment...
+
+Operational-first framing: "No intrusions," "standard environment," lists specific legitimate services as evidence of normalcy.
+
 ---
 
 ## Telemetry Analysis: Logfire Traces
@@ -187,6 +217,36 @@ Looking specifically at the complex risk assessment runs:
 | Total time | ~40s | ~42s |
 
 **Finding:** 3.7-flash ran **50% more queries** in **3 fewer run_code calls**, achieving higher query consolidation despite similar wall-clock time.
+
+### How They Investigated the Same Anomalies: Tone & Framing
+
+**The SYN Reconnect Loop (98,878 failed connections)**
+
+3.6-flash framing:
+> **Massive Unreachable Beaconing / Telemetry Loop**
+> 
+> This single connection loop accounts for **33.5% of all network flow records** in the log... High network overhead, flood of connection state table entries, **potential misconfigured C2/exfiltration agent** or telemetry drop-off.
+
+Keyword: "beaconing," "C2," emphasizes the potential for intentional command-and-control behavior.
+
+3.7-flash framing:
+> **Misconfigured / Failing Service Causing SYN Flooding**
+>
+> Generates continuous background network noise and wasted CPU cycles on the host attempting to reach an offline or misconfigured Tailscale service/agent.
+
+Keyword: "misconfigured," "failing service," frames as operational problem with known cause.
+
+**The Large SSH Transfer (523.5 MB across VLANs)**
+
+3.6-flash:
+> Cross-subnet lateral data movement or data staging. Needs verification against scheduled backups or legitimate administrative activities.
+
+Stated as a risk indicator; "lateral movement" is threat language.
+
+3.7-flash:
+> Consistent with an administrative file transfer, automated rsync/SCP backup, or container image push across subnets. Verify that 192.168.2.128 is an authorized internal backup target or server.
+
+Assumes legitimacy first; asks for verification rather than raising suspicion.
 
 ---
 
