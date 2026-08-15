@@ -43,7 +43,7 @@ Both models used the **same skill** (`skills/suricata-analyst`) with **identical
 **Query access:** Models queried the dataset via:
 - `describe_events()` — schema introspection
 - `aggregate_events()` — group-by aggregation (event type, source IP, protocol, etc.)
-- `query_sql()` — arbitrary SQL via DataFusion on Parquet-backed data
+- `query_sql()` — arbitrary SQL via DuckDB on Parquet-backed data (connection locked down with `allowed_paths` only)
 - `run_code()` — arbitrary Python in a sandbox with access to above functions
 
 **Workspace mode:** All runs used `--pristine` (isolated, fresh task workspace per run), preventing script reuse across models and eliminating confounds from artifact carryover.
