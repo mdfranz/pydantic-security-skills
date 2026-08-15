@@ -52,6 +52,8 @@ Both models produced identical results across all 3 runs:
 
 ### Speed Performance (3 Repetitions)
 
+![Speed Performance Chart](gemini-speed-performance.png)
+
 | Model | Run 1 | Run 2 | Run 3 | Average | Variance |
 |-------|-------|-------|-------|---------|----------|
 | **3.6-flash** | 5.6s | 5.0s | 8.4s | **6.3s** | 27% |
@@ -60,6 +62,8 @@ Both models produced identical results across all 3 runs:
 - **3.6-flash is 2.4× faster on average**
 - **3.6-flash is 4.2× faster at best case** (5.0s vs 21.1s)
 - 3.6-flash shows more consistent behavior (tighter variance, 27% vs 33%)
+
+![Speed Consistency Chart](gemini-speed-consistency.png)
 
 ### Tool Usage Patterns
 
@@ -173,6 +177,8 @@ Operational-first framing: "No intrusions," "standard environment," lists specif
 
 ### Chat Response Latency
 
+![Chat Latency Chart](gemini-chat-latency.png)
+
 | Model | Chat Calls | Avg Latency | P50 | P95 | Total Time |
 |-------|-----------|------------|-----|-----|-----------|
 | **3.6-flash** | 38 | 3.70s | 2.94s | 9.28s | 140.7s |
@@ -182,6 +188,8 @@ Operational-first framing: "No intrusions," "standard environment," lists specif
 
 ### Query Efficiency: SQL Batching
 
+![Query Efficiency Chart](gemini-query-efficiency.png)
+
 | Model | run_code Calls | SQL Queries | Queries/Call | Avg Query |
 |-------|---------------|------------|--------------|-----------|
 | **3.6-flash** | 576 | 1,000 | 1.74 | 48.3ms |
@@ -190,6 +198,8 @@ Operational-first framing: "No intrusions," "standard environment," lists specif
 **Key insight:** 3.7-flash batches queries **62% more aggressively**, running **28.8% more SQL** across **21% fewer calls** with **24% faster average query latency**.
 
 ### Tool Call Distribution (All Runs)
+
+![Tool Distribution Chart](gemini-tool-distribution.png)
 
 **3.6-flash:**
 - query_sql: 1,000 calls (32% of time)
@@ -206,6 +216,8 @@ Operational-first framing: "No intrusions," "standard environment," lists specif
 - **Total execution:** ~81.2 seconds | **Call throughput:** 21.2 calls/sec
 
 ### Risk Assessment Deep Dive (Subset)
+
+![Risk Assessment Chart](gemini-risk-assessment.png)
 
 Looking specifically at the complex risk assessment runs:
 
